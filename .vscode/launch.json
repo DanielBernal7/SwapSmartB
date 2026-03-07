@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Launch Current File",
+            "request": "launch",
+            "mainClass": "${file}"
+        },
+        {
+            "type": "java",
+            "name": "Spring Boot-SwapSmartApiApplication<SwapSmart-API>",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "mainClass": "com.SwapSmart.api.SwapSmartApiApplication",
+            "projectName": "SwapSmart-API",
+            "args": "",
+            "envFile": "${workspaceFolder}/.env"
+        }
+    ]
+}

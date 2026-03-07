@@ -1,49 +1,23 @@
 package com.SwapSmart.api.controller;
 
-import com.SwapSmart.api.dto.FoodDetailDTO;
-import com.SwapSmart.api.dto.FatSecretSearchResponse;
-import com.SwapSmart.api.dto.SearchResultDTO;
-import com.SwapSmart.api.service.FatSecretService;
+import com.SwapSmart.api.ProductService;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Map;
 
 @RestController
+@RequestMapping("/api")
 public class SearchController {
 
-    private final FatSecretService fatSecretService;
+    private final ProductService productService;
 
-    public SearchController(FatSecretService fatSecretService) {
-        this.fatSecretService = fatSecretService;
+    public SearchController(ProductService productService) {
+        this.productService = productService;
     }
 
-    @GetMapping(value = "/api/search", produces = "application/json")
-    public List<SearchResultDTO> search(@RequestParam String query) throws Exception {
-
-        FatSecretSearchResponse response = fatSecretService.searchFoods(query);
-
-        return response.food.stream()
-                .map(food -> new SearchResultDTO(
-                        food.foodId,
-                        food.foodName,
-                        food.brandName,
-                        food.description
-                ))
-                .collect(Collectors.toList());
+    @GetMapping(value = "/search", produces = "application/json")
+    public List<Map<String, Object>> search(@RequestParam String query) {
+        return productService.searchProducts(query);
     }
-
-    @GetMapping(value = "/api/food/{id}", produces = "application/json")
-    public FoodDetailDTO getFood(@PathVariable String id) throws Exception {
-        return fatSecretService.getFoodDetail(id);
-    }
-
-    private String extract(String xml, String key) {
-        int start = xml.indexOf(key);
-        if (start == -1) return "N/A";
-        int end = xml.indexOf("|", start);
-        if (end == -1) return "N/A";
-        return xml.substring(start, end).replace(key, "").trim();
-    }
-    
 }

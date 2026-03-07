@@ -57,5 +57,18 @@ public class ProductController {
 
         return ResponseEntity.ok(product);
     }
+    //new endpoint
+    @GetMapping("/food-by-id/{foodId}")
+    public ResponseEntity<Map<String, Object>> getFoodById(@PathVariable String foodId) {
+
+        Map<String, Object> food = productService.getDetails(foodId);
+
+        if (food == null) {
+            return ResponseEntity.status(404)
+                    .body(Map.of("error", "Food not found"));
+        }
+
+        return ResponseEntity.ok(food);
+    }
 
 }

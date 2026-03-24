@@ -529,4 +529,74 @@ public class ProductService {
             return null;
         }
     }
+    ///search stuff
+    public List<Map<String, Object>> searchProducts(String query) {
+        try {
+            String token = getToken();
+            if (token == null) return List.of();
+
+            String body = http.get()
+                    .uri(fsApiBase + "/foods/search/v1?search_expression={query}&page_number=0&max_results=10&format=json", query)
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve()
+                    .body(String.class);
+            ///System.out.println(body);
+
+            JsonNode root = JsonMapper.shared().readTree(body);
+            JsonNode foods = root.path("foods").path("food");
+
+            List<Map<String, Object>> results = new ArrayList<>();
+
+            if (foods.isArray()) {
+                for (JsonNode food : foods) {
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("id", food.path("food_id").asText());
+                    item.put("name", food.path("food_name").asText());
+                    item.put("brand", food.path("brand_name").asText(null));
+                    results.add(item);
+                }
+            }
+            return results;
+
+        } catch (Exception e) {
+            System.err.println("Search error: " + e.getMessage());
+            return List.of();
+        }
+    }
+
+    public Map<String, Object> getDetails(String foodId) {
+        try {
+            String token = getToken();
+            if (token == null) return null;
+
+            String body = http.get()
+                    .uri(fsApiBase + "/server.api?method=food.get.v2&food_id={id}&format=json", foodId)
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve()
+                    .body(String.class);
+
+            JsonNode root = JsonMapper.shared().readTree(body);
+            JsonNode food = root.path("food");
+            JsonNode servings = food.path("servings").path("serving");
+            JsonNode serving = servings.isArray() ? servings.get(0) : servings;
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("id", foodId);
+            result.put("name", food.path("food_name").asText(null));
+            result.put("brand", food.path("brand_name").asText(null));
+            result.put("serving_size", serving.path("serving_description").asText(null));
+            result.put("calories", serving.path("calories").asText(null));
+            result.put("fat", serving.path("fat").asText(null));
+            result.put("carbs", serving.path("carbohydrate").asText(null));
+            result.put("protein", serving.path("protein").asText(null));
+            result.put("sugar", serving.path("sugar").asText(null));
+
+            return result;
+
+        } catch (Exception e) {
+            System.err.println("Error fetching food details: " + e.getMessage());
+            return null;
+        }
+    }
+
 }

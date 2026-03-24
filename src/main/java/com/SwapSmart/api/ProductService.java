@@ -10,14 +10,18 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.math.BigDecimal;
+import java.sql.Array;
 import java.time.Instant;
 import java.util.*;
+
+import org.springframework.jdbc.core.ConnectionCallback;
 
 @Service
 public class ProductService {
     private final JdbcTemplate db;
     private final NamedParameterJdbcTemplate namedDb;
     private final RestClient http;
+    private final UsdaService usdaService;
 
     @Value("${fatsecret.client-id}")
     private String fsClientId;
@@ -35,10 +39,11 @@ public class ProductService {
     private String fsToken;
     private Instant fsTokenExpiry = Instant.MIN;
 
-    public ProductService(JdbcTemplate db) {
+    public ProductService(JdbcTemplate db, UsdaService usdaService) {
         this.db = db;
         this.namedDb = new NamedParameterJdbcTemplate(db);
         this.http = RestClient.create();
+        this.usdaService = usdaService;
     }
 
     // This the main focus cache first then API lookups.
@@ -64,10 +69,43 @@ public class ProductService {
         if (product != null) {
             System.out.println("FatSecret API");
             cacheFatSecretProduct(gtin, product);
+            String fsCategory;
+            if (product.get("category") != null) {
+                fsCategory = product.get("category").toString();
+            } else {
+                fsCategory = null;
+            }
+            String foodId;
+            if (product.get("food_id") != null) {
+                foodId = product.get("food_id").toString();
+            } else {
+                foodId = null;
+            }
+            usdaService.enrichFatSecretProduct(gtin, foodId, fsCategory);
+            List<Map<String, Object>> enriched = db.queryForList(
+                    "SELECT product_type, usda_category FROM fatsecret_products WHERE gtin = ?", gtin);
+            if (!enriched.isEmpty()) {
+                product.put("product_type", enriched.getFirst().get("product_type"));
+                product.put("usda_category", enriched.getFirst().get("usda_category"));
+            }
             return withSource(product, "fatsecret");
         }
 
-        // 4. Try Open Food Facts as fallback
+        // 4. Try USDA FoodData Central
+        product = usdaService.lookupByGtin(gtin);
+        if (product != null) {
+            System.out.println("USDA API/Cache");
+            String usdaCategory;
+            if (product.get("category") != null) {
+                usdaCategory = product.get("category").toString();
+            } else {
+                usdaCategory = null;
+            }
+            product.put("product_type", UsdaService.deriveProductType(usdaCategory));
+            return withSource(product, "usda");
+        }
+
+        // 5. Try Open Food Facts as last fallback
         product = fetchFromOpenFoodFacts(gtin);
         if (product != null) {
             System.out.println("Open Food Facts API");
@@ -113,10 +151,15 @@ public class ProductService {
 
         try {
             if (foodId != null && !foodId.isBlank()) {
+                Object rawCats = product.get("categories");
+                Array categoriesArray = null;
+                if (rawCats instanceof List) {
+                    categoriesArray = toSqlTextArray((List<?>) rawCats);
+                }
                 int updated = db.update(
                         "UPDATE fatsecret_products SET "
                                 + "gtin = ?, name = ?, brand = ?, category = ?, "
-                                // COALESCE keeps whichever image_url isn't null (this is for future plans)
+                                + "categories = COALESCE(?, categories), "
                                 + "image_url = COALESCE(?, image_url), "
                                 + "serving_size = ?, calories = ?, total_fat = ?, "
                                 + "saturated_fat = ?, trans_fat = ?, cholesterol = ?, "
@@ -125,7 +168,8 @@ public class ProductService {
                                 + "raw_json = CAST(? AS jsonb) "
                                 + "WHERE food_id = ? AND gtin IS NULL",
                         gtin, product.get("name"), product.get("brand"),
-                        product.get("category"), product.get("image_url"),
+                        product.get("category"), categoriesArray,
+                        product.get("image_url"),
                         product.get("serving_size"),
                         product.get("calories"), product.get("total_fat"),
                         product.get("saturated_fat"), product.get("trans_fat"),
@@ -145,11 +189,16 @@ public class ProductService {
             // No existing row to merge into, just insert fresh.
             // Using named params here because there's a way too many columns and
             // ? would be impossible to keep track of.
-            String cols = "gtin, food_id, name, brand, category, image_url, serving_size, "
+            Object rawCatsInsert = product.get("categories");
+            if (rawCatsInsert instanceof List) {
+                product.put("categories", toSqlTextArray((List<?>) rawCatsInsert));
+            }
+
+            String cols = "gtin, food_id, name, brand, category, categories, image_url, serving_size, "
                     + "calories, total_fat, saturated_fat, trans_fat, cholesterol, "
                     + "sodium, total_carbs, dietary_fiber, total_sugars, added_sugars, "
                     + "protein, raw_json";
-            String vals = ":gtin, :food_id, :name, :brand, :category, :image_url, :serving_size, "
+            String vals = ":gtin, :food_id, :name, :brand, :category, :categories, :image_url, :serving_size, "
                     + ":calories, :total_fat, :saturated_fat, :trans_fat, :cholesterol, "
                     + ":sodium, :total_carbs, :dietary_fiber, :total_sugars, :added_sugars, "
                     + ":protein, CAST(:raw_json AS jsonb)";
@@ -157,9 +206,9 @@ public class ProductService {
             namedDb.update(
                     "INSERT INTO fatsecret_products (" + cols + ") "
                             + "VALUES (" + vals + ") "
-                            // If this gtin already exists, just backfill food_id and image
                             + "ON CONFLICT (gtin) DO UPDATE SET "
                             + "  food_id = COALESCE(fatsecret_products.food_id, EXCLUDED.food_id), "
+                            + "  categories = COALESCE(EXCLUDED.categories, fatsecret_products.categories), "
                             + "  image_url = COALESCE(EXCLUDED.image_url, fatsecret_products.image_url)",
                     product);
         } catch (Exception e) {
@@ -319,12 +368,25 @@ public class ProductService {
             serving = servings;
         }
 
-        // Category can be an array ["Granola", "Cereal"] or just a string "Granola"
-        String category = null;
-        if (subCats.isArray() && !subCats.isEmpty()) {
-            category = subCats.get(0).asString(null);
+        List<String> categoriesList = new ArrayList<>();
+        if (subCats.isArray()) {
+            for (JsonNode sc : subCats) {
+                String val = sc.asString(null);
+                if (val != null && !val.isBlank()) {
+                    categoriesList.add(val);
+                }
+            }
         } else if (!subCats.isMissingNode() && !subCats.isNull()) {
-            category = subCats.asString(null);
+            String val = subCats.asString(null);
+            if (val != null && !val.isBlank()) {
+                categoriesList.add(val);
+            }
+        }
+        String category;
+        if (categoriesList.isEmpty()) {
+            category = null;
+        } else {
+            category = categoriesList.get(0);
         }
 
         // Grab the first product image if they gave us any (usually there is not image
@@ -341,6 +403,7 @@ public class ProductService {
         product.put("name", food.path("food_name").asString(""));
         product.put("brand", food.path("brand_name").asString(null));
         product.put("category", category);
+        product.put("categories", categoriesList);
         product.put("image_url", imageUrl);
         product.put("serving_size", serving.path("serving_description").asString(null));
         product.put("calories", num(serving, "calories"));
@@ -449,5 +512,21 @@ public class ProductService {
     private Map<String, Object> withSource(Map<String, Object> product, String source) {
         product.put("source", source);
         return product;
+    }
+
+    private Array toSqlTextArray(List<?> list) {
+        if (list == null || list.isEmpty()) {
+            return null;
+        }
+        try {
+            String[] arr = new String[list.size()];
+            for (int i = 0; i < list.size(); i++) {
+                arr[i] = list.get(i).toString();
+            }
+            return db.execute((ConnectionCallback<Array>) conn ->
+                    conn.createArrayOf("text", arr));
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

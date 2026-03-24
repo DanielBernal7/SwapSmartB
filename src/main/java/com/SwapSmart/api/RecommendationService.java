@@ -2,9 +2,11 @@ package com.SwapSmart.api;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.sql.Array;
 import java.util.*;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -78,19 +80,15 @@ public class RecommendationService {
             "gummy", "candy", "chocolate", "chips", "pretzels", "popcorn",
             "jerky", "nuts", "bars", "jam", "jelly", "syrup");
 
-    private static final Set<String> EXCLUDED_CATEGORIES = Set.of(
-            "supplements", "protein powder", "drink mixes",
-            "baby foods", "infant formula");
+    private final UsdaService usdaService;
 
-    private static final Set<String> GENERIC_CATEGORIES = Set.of(
-            "snacks", "beverages", "foods", "other", "misc", "general",
-            "frozen foods", "canned foods", "condiments", "prepared foods");
-
-    public RecommendationService(ProductService productService, JdbcTemplate db) {
+    public RecommendationService(ProductService productService, JdbcTemplate db,
+            UsdaService usdaService) {
         this.productService = productService;
         this.db = db;
         this.namedDb = new NamedParameterJdbcTemplate(db);
         this.http = RestClient.create();
+        this.usdaService = usdaService;
     }
 
     public RecommendationResult recommend(String gtin, String criteria) {
@@ -112,12 +110,13 @@ public class RecommendationService {
         scannedSummary.put("sodium", scanned.get("sodium"));
         scannedSummary.put("total_fat", scanned.get("total_fat"));
         scannedSummary.put("protein", scanned.get("protein"));
+        scannedSummary.put("added_sugars", scanned.get("added_sugars"));
 
         if ("sugar".equals(criteria)) {
             List<Map<String, Object>> cached = getCachedAlternatives(gtin);
             if (cached != null) {
                 System.out.println("Recommendations from CACHE for gtin: " + gtin);
-                return new RecommendationResult(scannedSummary, cached, criteria);
+                return new RecommendationResult(scannedSummary, toRecommendationSummaries(cached), criteria);
             }
         }
 
@@ -136,224 +135,173 @@ public class RecommendationService {
             return new RecommendationResult(scannedSummary, Collections.emptyList(), criteria);
         }
 
-        String scannedCategory = "";
-        if (scanned.get("category") != null) {
-            scannedCategory = scanned.get("category").toString().toLowerCase().trim();
-        }
+        String productType = resolveProductType(scanned, gtin);
 
-        boolean categoryFromOFF = scannedCategory.startsWith("en:");
-        if (categoryFromOFF) {
-            scannedCategory = scannedCategory.substring(3).replace('-', ' ');
-        }
-
-        boolean hasUsableCategory = !scannedCategory.isBlank()
-                && !GENERIC_CATEGORIES.contains(scannedCategory)
-                && !categoryFromOFF;
-
-        String category = "";
-        if (scanned.get("category") != null) {
-            category = scanned.get("category").toString();
-        }
-
-        String categoryHint = categoryToHint(category);
-        boolean queryFromCategory = !categoryHint.isBlank();
-
-        String categorySearchQuery;
-        if (queryFromCategory) {
-            categorySearchQuery = categoryHint;
-        } else {
-            categorySearchQuery = buildSearchQuery(nameRaw.toString(), category, hasUsableCategory);
-        }
-
-        String nameSearchQuery = buildSearchQuery(nameRaw.toString(), category, true);
-
-        System.out.println("Category search query: \""
-                + categorySearchQuery + "\" (from: \"" + nameRaw + "\") criteria=" + criteria);
-        System.out.println("Name search query: \""
-                + nameSearchQuery + "\" (from: \"" + nameRaw + "\") criteria=" + criteria);
-
-        String brandRaw = "";
+        String brandRaw;
         if (scanned.get("brand") != null) {
             brandRaw = scanned.get("brand").toString();
+        } else {
+            brandRaw = "";
         }
 
-        List<Map<String, Object>> brandCandidates = new ArrayList<>();
+        String searchQuery;
+        if (productType != null && !productType.isBlank()) {
+            searchQuery = productType;
+            System.out.println("Product-type search: \"" + searchQuery + "\" criteria=" + criteria);
+        } else {
+            Set<String> scannedCategories = getCategories(scanned);
+            if (scannedCategories.isEmpty() && scanned.get("category") != null) {
+                scannedCategories.add(scanned.get("category").toString().toLowerCase().trim());
+            }
+            Set<String> usableCategories = new LinkedHashSet<>();
+            for (String cat : scannedCategories) {
+                String norm;
+                if (cat.startsWith("en:")) {
+                    norm = cat.substring(3).replace('-', ' ');
+                } else {
+                    norm = cat;
+                }
+                if (!norm.isBlank() && !GENERIC_CATEGORIES.contains(norm)) {
+                    usableCategories.add(norm);
+                }
+            }
+            String category;
+            if (scanned.get("category") != null) {
+                category = scanned.get("category").toString();
+            } else {
+                category = "";
+            }
+            searchQuery = buildSearchQuery(nameRaw.toString(), category, !usableCategories.isEmpty());
+            System.out.println("Name-token search: \"" + searchQuery + "\" criteria=" + criteria);
+        }
+
+        Map<String, Map<String, Object>> seenById = new LinkedHashMap<>();
+
         if (!brandRaw.isBlank()) {
-            String brandQuery = brandRaw + " " + categorySearchQuery;
-            System.out.println("Brand search query: \"" + brandQuery + "\"");
-            brandCandidates = fetchAllCandidates(brandQuery, gtin);
+            System.out.println("Brand search: \"" + brandRaw + "\"");
+            for (Map<String, Object> c : fetchAllCandidates(brandRaw, gtin)) {
+                seenById.put(candidateId(c), c);
+            }
         }
 
-        List<Map<String, Object>> categoryCandidates = fetchAllCandidates(categorySearchQuery, gtin);
-
-        List<Map<String, Object>> nameCandidates = new ArrayList<>();
-        if (!nameSearchQuery.equals(categorySearchQuery)) {
-            nameCandidates = fetchAllCandidates(nameSearchQuery, gtin);
+        if (productType != null) {
+            List<Map<String, Object>> dbCandidates = getCandidatesFromDb(productType, field, gtin);
+            System.out.println("DB candidates for product_type=\"" + productType + "\": " + dbCandidates.size());
+            for (Map<String, Object> c : dbCandidates) {
+                seenById.putIfAbsent(candidateId(c), c);
+            }
         }
 
-        Map<String, Map<String, Object>> seen = new LinkedHashMap<>();
+        Set<String> distinctBrandSet = new LinkedHashSet<>();
+        for (Map<String, Object> c : seenById.values()) {
+            String b;
+            if (c.get("brand") != null) {
+                b = c.get("brand").toString().toLowerCase().trim();
+            } else {
+                b = "";
+            }
+            if (!b.isBlank()) {
+                distinctBrandSet.add(b);
+            }
+        }
+        long distinctBrands = distinctBrandSet.size();
+        boolean isDiverse = seenById.size() >= MAX_RECOMMENDATIONS * 4 && distinctBrands >= MAX_RECOMMENDATIONS;
+        if (!isDiverse) {
+            System.out.println("API search: \"" + searchQuery + "\"");
+            for (Map<String, Object> c : fetchAllCandidates(searchQuery, gtin)) {
+                seenById.putIfAbsent(candidateId(c), c);
+            }
+        }
 
-        Map<String, Object> bestBrandCandidate = null;
-        for (Map<String, Object> c : brandCandidates) {
+        String scannedServing;
+        if (scanned.get("serving_size") != null) {
+            scannedServing = scanned.get("serving_size").toString();
+        } else {
+            scannedServing = "";
+        }
+        boolean scannedLiquid = isLiquidServing(scannedServing);
+        boolean scannedNonLiquid = isNonLiquidServing(scannedServing);
+
+        List<Map<String, Object>> passing = new ArrayList<>();
+        for (Map<String, Object> c : seenById.values()) {
             Object raw = c.get(field);
             if (raw == null) {
                 continue;
             }
             BigDecimal val = toBigDecimal(raw.toString());
-            if (val != null && val.compareTo(scannedValue) < 0) {
-                bestBrandCandidate = c;
-                break;
+            if (val == null || val.compareTo(scannedValue) >= 0) {
+                continue;
             }
-        }
 
-        if (bestBrandCandidate != null) {
-            String id;
-            if (bestBrandCandidate.get("food_id") != null) {
-                id = bestBrandCandidate.get("food_id").toString();
+            String candidateServing;
+            if (c.get("serving_size") != null) {
+                candidateServing = c.get("serving_size").toString();
             } else {
-                id = bestBrandCandidate.get("name").toString();
+                candidateServing = "";
             }
-            seen.put(id, bestBrandCandidate);
-        }
+            if (scannedLiquid && isNonLiquidServing(candidateServing)) {
+                continue;
+            }
+            if (scannedNonLiquid && isLiquidServing(candidateServing)) {
+                continue;
+            }
 
-        for (Map<String, Object> c : categoryCandidates) {
-            String id;
-            if (c.get("food_id") != null) {
-                id = c.get("food_id").toString();
+            if (productType != null) {
+                String candidateType = deriveCandidateProductType(c);
+                if (candidateType != null && !candidateType.equals(productType)) {
+                    continue;
+                }
+            }
+
+            String totalSugarsRaw;
+            if (c.get("total_sugars") != null) {
+                totalSugarsRaw = c.get("total_sugars").toString();
             } else {
-                id = c.get("name").toString();
+                totalSugarsRaw = null;
             }
-            seen.putIfAbsent(id, c);
-        }
-
-        for (Map<String, Object> c : nameCandidates) {
-            String id;
-            if (c.get("food_id") != null) {
-                id = c.get("food_id").toString();
-            } else {
-                id = c.get("name").toString();
-            }
-            seen.putIfAbsent(id, c);
-        }
-
-        List<Map<String, Object>> allCandidates = new ArrayList<>(seen.values());
-
-        if (hasUsableCategory) {
-            List<Map<String, Object>> filtered = new ArrayList<>();
-            for (Map<String, Object> c : allCandidates) {
-                String cat = "";
-                if (c.get("category") != null) {
-                    cat = c.get("category").toString().toLowerCase().trim();
-                }
-                if (cat.equals(scannedCategory) || cat.contains(scannedCategory) || scannedCategory.contains(cat)) {
-                    filtered.add(c);
+            BigDecimal totalSugars = toBigDecimal(totalSugarsRaw);
+            if (c.get("added_sugars") == null) {
+                if (totalSugars != null && totalSugars.compareTo(BigDecimal.ZERO) == 0) {
+                    c.put("added_sugars", BigDecimal.ZERO);
+                } else {
+                    continue;
                 }
             }
-            if (filtered.size() >= MAX_RECOMMENDATIONS) {
-                allCandidates = filtered;
-            }
-        } else {
-            List<Map<String, Object>> withoutExcluded = new ArrayList<>();
-            for (Map<String, Object> c : allCandidates) {
-                String cat = "";
-                if (c.get("category") != null) {
-                    cat = c.get("category").toString().toLowerCase().trim();
-                }
-                if (!EXCLUDED_CATEGORIES.contains(cat)) {
-                    withoutExcluded.add(c);
-                }
-            }
-            allCandidates = withoutExcluded;
 
-            double[] scannedVec = nutritionVector(scanned);
-
-            allCandidates.sort(Comparator.comparingDouble(c -> {
-                double[] candVec = nutritionVector((Map<String, Object>) c);
-                return euclideanDistance(scannedVec, candVec);
-            }));
-
-            int keep = Math.max(MAX_RECOMMENDATIONS * 4, 30);
-            if (allCandidates.size() > keep) {
-                allCandidates = new ArrayList<>(allCandidates.subList(0, keep));
-            }
+            passing.add(c);
         }
 
-        boolean useCombinedScore = !hasUsableCategory;
-        double[] scannedVecFinal = null;
-        if (useCombinedScore) {
-            scannedVecFinal = nutritionVector(scanned);
-        }
-
-        final boolean finalUseCombinedScore = useCombinedScore;
-        final double[] finalScannedVec = scannedVecFinal;
+        double[] scannedVec = nutritionVectorForCriteria(scanned, criteria);
+        passing.sort(Comparator.comparingDouble(
+                c -> euclideanDistance(scannedVec, nutritionVectorForCriteria((Map<String, Object>) c, criteria))));
 
         List<Map<String, Object>> recommendations = new ArrayList<>();
-        int windowSize = Math.min(50, allCandidates.size());
-
-        while (recommendations.size() < MAX_RECOMMENDATIONS && windowSize <= allCandidates.size()) {
-            List<Map<String, Object>> window = new ArrayList<>();
-            for (Map<String, Object> c : allCandidates.subList(0, windowSize)) {
-                Object raw = c.get(field);
-                if (raw == null) {
-                    continue;
-                }
-                BigDecimal val = toBigDecimal(raw.toString());
-                if (val == null) {
-                    continue;
-                }
-                if (val.compareTo(scannedValue) < 0) {
-                    window.add(c);
-                }
-            }
-
-            window.sort(Comparator.comparingDouble(c -> {
-                Object raw = ((Map<String, Object>) c).get(field);
-                if (raw == null) {
-                    return Double.MAX_VALUE;
-                }
-                BigDecimal val = toBigDecimal(raw.toString());
-                if (val == null) {
-                    return Double.MAX_VALUE;
-                }
-                if (finalUseCombinedScore) {
-                    double sugarScore = val.doubleValue();
-                    double dist = euclideanDistance(finalScannedVec, nutritionVector((Map<String, Object>) c));
-                    return sugarScore + (dist * 1.5);
-                }
-                return val.doubleValue();
-            }));
-
-            recommendations = new ArrayList<>();
-            for (int i = 0; i < Math.min(MAX_RECOMMENDATIONS, window.size()); i++) {
-                recommendations.add(window.get(i));
-            }
-
-            if (windowSize == allCandidates.size()) {
+        Map<String, Integer> brandCounts = new LinkedHashMap<>();
+        for (Map<String, Object> c : passing) {
+            if (recommendations.size() >= MAX_RECOMMENDATIONS) {
                 break;
             }
-            windowSize = Math.min(windowSize + 20, allCandidates.size());
+            String brand;
+            if (c.get("brand") != null) {
+                brand = c.get("brand").toString().toLowerCase().trim();
+            } else {
+                brand = "";
+            }
+            int count = brandCounts.getOrDefault(brand, 0);
+            if (!brand.isBlank() && count >= 2) {
+                continue;
+            }
+            brandCounts.put(brand, count + 1);
+            recommendations.add(c);
         }
 
-        recommendations.sort(Comparator.comparing(c -> {
-            Object raw = ((Map<String, Object>) c).get(field);
-            if (raw == null) {
-                return BigDecimal.valueOf(Double.MAX_VALUE);
-            }
-            BigDecimal val = toBigDecimal(raw.toString());
-            if (val != null) {
-                return val;
-            }
-            return BigDecimal.valueOf(Double.MAX_VALUE);
-        }));
-
         if ("sugar".equals(criteria)) {
-            String sourceTable = sourceTableName(scanned);
-            saveAlternatives(gtin, sourceTable, scannedValue, recommendations);
+            saveAlternatives(gtin, productType, scannedValue, recommendations);
         }
 
         System.out.println("Returning " + recommendations.size()
                 + " recommendations (" + criteria + ") for gtin: " + gtin);
-        return new RecommendationResult(scannedSummary, recommendations, criteria);
+        return new RecommendationResult(scannedSummary, toRecommendationSummaries(recommendations), criteria);
     }
 
     private List<Map<String, Object>> fetchAllCandidates(String query, String excludeGtin) {
@@ -404,6 +352,7 @@ public class RecommendationService {
             String body = http.get()
                     .uri(fsApiBase + "/server.api"
                             + "?method=foods.search.v5"
+                            + "&region=US"
                             + "&search_expression={query}"
                             + "&page_number={page}"
                             + "&max_results={maxResults}"
@@ -416,6 +365,16 @@ public class RecommendationService {
                     .header("Authorization", "Bearer " + token)
                     .retrieve()
                     .body(String.class);
+            if (body == null || body.isBlank()) {
+                System.err.println("FatSecret search page " + pageNumber + ": empty response body");
+                return new SearchPage(0, List.of());
+            }
+            if (!body.trim().startsWith("{")) {
+                System.err.println("FatSecret search page " + pageNumber
+                        + ": unexpected response (not JSON): "
+                        + body.substring(0, Math.min(300, body.length())));
+                return new SearchPage(0, List.of());
+            }
 
             JsonNode root = JsonMapper.shared().readTree(body);
             JsonNode envelope = root.path("foods_search");
@@ -473,8 +432,25 @@ public class RecommendationService {
             return null;
         }
 
-        String categoryVal = extractFirstSubCategory(
+        BigDecimal calories = numNode(serving, "calories");
+        if (calories == null) {
+            return null;
+        }
+
+        BigDecimal protein = numNode(serving, "protein");
+        BigDecimal fat = numNode(serving, "fat");
+        if (protein == null && fat == null) {
+            return null;
+        }
+
+        List<String> categoriesList = extractAllSubCategories(
                 food.path("food_sub_categories").path("food_sub_category"));
+        String categoryVal;
+        if (categoriesList.isEmpty()) {
+            categoryVal = null;
+        } else {
+            categoryVal = categoriesList.get(0);
+        }
 
         String imageUrl = null;
         JsonNode images = food.path("food_images").path("food_image");
@@ -493,7 +469,7 @@ public class RecommendationService {
         item.put("food_type", stringValue(food.path("food_type")));
         item.put("category", categoryVal);
         item.put("serving_size", stringValue(serving.path("serving_description")));
-        item.put("calories", numNode(serving, "calories"));
+        item.put("calories", calories);
         item.put("total_fat", numNode(serving, "fat"));
         item.put("saturated_fat", numNode(serving, "saturated_fat"));
         item.put("trans_fat", numNode(serving, "trans_fat"));
@@ -505,6 +481,7 @@ public class RecommendationService {
         item.put("added_sugars", numNode(serving, "added_sugars"));
         item.put("protein", numNode(serving, "protein"));
         item.put("image_url", imageUrl);
+        item.put("categories", categoriesList);
         item.put("source", "fatsecret");
 
         return item;
@@ -516,7 +493,8 @@ public class RecommendationService {
         Map<String, Object> params = toParamMap(product);
 
         try {
-            if (gtin != null && !gtin.isBlank() && foodId != null && !foodId.isBlank()) {
+            if (gtin != null && !gtin.isBlank()
+                    && foodId != null && !foodId.isBlank()) {
                 int updated = namedDb.update(
                         "UPDATE fatsecret_products SET gtin = :gtin "
                                 + "WHERE food_id = :food_id AND gtin IS NULL",
@@ -529,29 +507,32 @@ public class RecommendationService {
             if (gtin != null && !gtin.isBlank()) {
                 namedDb.update(
                         "INSERT INTO fatsecret_products "
-                                + "(gtin, food_id, name, brand, category, serving_size, "
+                                + "(gtin, food_id, name, brand, category, categories, serving_size, "
                                 + " calories, total_fat, saturated_fat, trans_fat, cholesterol, "
                                 + " sodium, total_carbs, dietary_fiber, total_sugars, added_sugars, "
-                                + " protein, image_url) "
-                                + "VALUES (:gtin, :food_id, :name, :brand, :category, :serving_size, "
+                                + " protein, image_url, product_type) "
+                                + "VALUES (:gtin, :food_id, :name, :brand, :category, :categories, :serving_size, "
                                 + " :calories, :total_fat, :saturated_fat, :trans_fat, :cholesterol, "
                                 + " :sodium, :total_carbs, :dietary_fiber, :total_sugars, :added_sugars, "
-                                + " :protein, :image_url) "
+                                + " :protein, :image_url, :product_type) "
                                 + "ON CONFLICT (gtin) DO UPDATE SET "
-                                + "  food_id = COALESCE(fatsecret_products.food_id, EXCLUDED.food_id)",
+                                + "  food_id = COALESCE(fatsecret_products.food_id, EXCLUDED.food_id), "
+                                + "  categories = COALESCE(EXCLUDED.categories, fatsecret_products.categories), "
+                                + "  product_type = COALESCE(fatsecret_products.product_type, EXCLUDED.product_type)",
                         params);
             } else if (foodId != null && !foodId.isBlank()) {
                 namedDb.update(
                         "INSERT INTO fatsecret_products "
-                                + "(food_id, name, brand, category, serving_size, "
+                                + "(food_id, name, brand, category, categories, serving_size, "
                                 + " calories, total_fat, saturated_fat, trans_fat, cholesterol, "
                                 + " sodium, total_carbs, dietary_fiber, total_sugars, added_sugars, "
-                                + " protein, image_url) "
-                                + "VALUES (:food_id, :name, :brand, :category, :serving_size, "
+                                + " protein, image_url, product_type) "
+                                + "VALUES (:food_id, :name, :brand, :category, :categories, :serving_size, "
                                 + " :calories, :total_fat, :saturated_fat, :trans_fat, :cholesterol, "
                                 + " :sodium, :total_carbs, :dietary_fiber, :total_sugars, :added_sugars, "
-                                + " :protein, :image_url) "
-                                + "ON CONFLICT (food_id) DO NOTHING",
+                                + " :protein, :image_url, :product_type) "
+                                + "ON CONFLICT (food_id) DO UPDATE SET "
+                                + "  product_type = COALESCE(fatsecret_products.product_type, EXCLUDED.product_type)",
                         params);
             }
         } catch (Exception e) {
@@ -580,7 +561,76 @@ public class RecommendationService {
         params.put("added_sugars", product.get("added_sugars"));
         params.put("protein", product.get("protein"));
         params.put("image_url", product.get("image_url"));
+        params.put("categories", toSqlTextArray(product.get("categories")));
+        String fsCategory;
+        if (product.get("category") != null) {
+            fsCategory = product.get("category").toString();
+        } else {
+            fsCategory = null;
+        }
+        params.put("product_type", UsdaService.deriveProductType(fsCategory));
         return params;
+    }
+
+    private List<Map<String, Object>> toRecommendationSummaries(List<Map<String, Object>> products) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> p : products) {
+            Map<String, Object> s = new LinkedHashMap<>();
+            s.put("name", p.get("name"));
+            s.put("brand", p.get("brand"));
+            s.put("category", p.get("category"));
+            s.put("image_url", p.get("image_url"));
+            s.put("serving_size", p.get("serving_size"));
+            s.put("calories", p.get("calories"));
+            s.put("total_sugars", p.get("total_sugars"));
+            s.put("added_sugars", p.get("added_sugars"));
+            s.put("sodium", p.get("sodium"));
+            s.put("total_fat", p.get("total_fat"));
+            s.put("saturated_fat", p.get("saturated_fat"));
+            s.put("protein", p.get("protein"));
+            s.put("dietary_fiber", p.get("dietary_fiber"));
+            s.put("total_carbs", p.get("total_carbs"));
+            s.put("sugar_reduction_pct", p.get("sugar_reduction_pct"));
+            result.add(s);
+        }
+        return result;
+    }
+
+    private String candidateId(Map<String, Object> c) {
+        if (c.get("food_id") != null) {
+            return c.get("food_id").toString();
+        }
+        if (c.get("name") != null) {
+            return c.get("name").toString();
+        }
+        return "";
+    }
+
+    private List<Map<String, Object>> getCandidatesFromDb(String productType,
+            String field, String excludeGtin) {
+        if (productType == null || productType.isBlank()) {
+            return Collections.emptyList();
+        }
+        if (!CRITERIA_FIELDS.containsValue(field)) {
+            return Collections.emptyList();
+        }
+
+        try {
+            String sql = "SELECT * FROM fatsecret_products "
+                    + "WHERE product_type = ? AND " + field + " IS NOT NULL "
+                    + "AND (gtin IS NULL OR gtin != ?) "
+                    + "ORDER BY " + field + " ASC LIMIT 60";
+            String gtinParam;
+            if (excludeGtin != null) {
+                gtinParam = excludeGtin;
+            } else {
+                gtinParam = "";
+            }
+            return db.queryForList(sql, productType, gtinParam);
+        } catch (Exception e) {
+            System.err.println("DB candidate query failed: " + e.getMessage());
+            return Collections.emptyList();
+        }
     }
 
     private List<Map<String, Object>> getCachedAlternatives(String sourceGtin) {
@@ -601,30 +651,20 @@ public class RecommendationService {
             for (Map<String, Object> row : rows) {
                 String altFoodId = (String) row.get("alternative_food_id");
                 String altGtin = (String) row.get("alternative_gtin");
-                String altTableName = (String) row.get("alternative_table");
 
                 Map<String, Object> product = null;
 
-                if ("fatsecret".equals(altTableName)) {
-                    if (altFoodId != null && !altFoodId.isBlank()) {
-                        List<Map<String, Object>> products = db.queryForList(
-                                "SELECT * FROM fatsecret_products WHERE food_id = ?",
-                                altFoodId);
-                        if (!products.isEmpty()) {
-                            product = new LinkedHashMap<>(products.getFirst());
-                        }
-                    }
-                    if (product == null && altGtin != null && !altGtin.isBlank()) {
-                        List<Map<String, Object>> products = db.queryForList(
-                                "SELECT * FROM fatsecret_products WHERE gtin = ?",
-                                altGtin);
-                        if (!products.isEmpty()) {
-                            product = new LinkedHashMap<>(products.getFirst());
-                        }
-                    }
-                } else if ("openfoodfacts".equals(altTableName) && altGtin != null) {
+                if (altFoodId != null && !altFoodId.isBlank()) {
                     List<Map<String, Object>> products = db.queryForList(
-                            "SELECT * FROM openfoodfacts_products WHERE gtin = ?",
+                            "SELECT * FROM fatsecret_products WHERE food_id = ?",
+                            altFoodId);
+                    if (!products.isEmpty()) {
+                        product = new LinkedHashMap<>(products.getFirst());
+                    }
+                }
+                if (product == null && altGtin != null && !altGtin.isBlank()) {
+                    List<Map<String, Object>> products = db.queryForList(
+                            "SELECT * FROM fatsecret_products WHERE gtin = ?",
                             altGtin);
                     if (!products.isEmpty()) {
                         product = new LinkedHashMap<>(products.getFirst());
@@ -634,7 +674,7 @@ public class RecommendationService {
                 if (product != null) {
                     product.put("sugar_difference", row.get("sugar_difference"));
                     product.put("sugar_reduction_pct", row.get("sugar_reduction_pct"));
-                    product.put("source", altTableName);
+                    product.put("source", "fatsecret");
                     results.add(product);
                 }
             }
@@ -651,7 +691,7 @@ public class RecommendationService {
         }
     }
 
-    private void saveAlternatives(String sourceGtin, String sourceTable,
+    private void saveAlternatives(String sourceGtin, String productType,
             BigDecimal scannedSugar,
             List<Map<String, Object>> recommendations) {
         int rank = 0;
@@ -686,19 +726,17 @@ public class RecommendationService {
 
                 db.update(
                         "INSERT INTO alternatives "
-                                + "(source_gtin, source_table, alternative_food_id, "
-                                + " alternative_gtin, alternative_table, "
-                                + " sugar_difference, sugar_reduction_pct, category_match, rank) "
-                                + "VALUES (?, ?, ?, ?, 'fatsecret', ?, ?, ?, ?) "
+                                + "(source_gtin, alternative_food_id, alternative_gtin, "
+                                + " sugar_difference, sugar_reduction_pct, product_type, rank) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?) "
                                 + "ON CONFLICT (source_gtin, alternative_food_id) DO UPDATE SET "
                                 + "  alternative_gtin = EXCLUDED.alternative_gtin, "
                                 + "  sugar_difference = EXCLUDED.sugar_difference, "
                                 + "  sugar_reduction_pct = EXCLUDED.sugar_reduction_pct, "
-                                + "  category_match = EXCLUDED.category_match, "
+                                + "  product_type = EXCLUDED.product_type, "
                                 + "  rank = EXCLUDED.rank",
-                        sourceGtin, sourceTable, altFoodId, altGtin,
-                        sugarDiff, reductionPct,
-                        alt.get("category"), rank);
+                        sourceGtin, altFoodId, altGtin,
+                        sugarDiff, reductionPct, productType, rank);
 
             } catch (Exception e) {
                 System.err.println("Alternatives save failed for food_id=" + altFoodId + ": " + e.getMessage());
@@ -736,25 +774,78 @@ public class RecommendationService {
         return String.join(" ", Arrays.copyOf(raw, Math.min(2, raw.length)));
     }
 
-    private String extractFirstSubCategory(JsonNode node) {
+    private List<String> extractAllSubCategories(JsonNode node) {
+        List<String> result = new ArrayList<>();
         if (node.isMissingNode() || node.isNull()) {
-            return null;
+            return result;
         }
         if (node.isArray()) {
-            if (node.isEmpty()) {
-                return null;
+            for (JsonNode item : node) {
+                String val = stringValue(item);
+                if (val != null && !val.isBlank()) {
+                    result.add(val);
+                }
             }
-            return stringValue(node.get(0));
+            return result;
         }
-        return stringValue(node);
+        String val = stringValue(node);
+        if (val != null && !val.isBlank()) {
+            result.add(val);
+        }
+        return result;
     }
 
-    private String sourceTableName(Map<String, Object> product) {
-        Object source = product.get("source");
-        if ("openfoodfacts".equals(source)) {
-            return "openfoodfacts";
+    private Set<String> getCategories(Map<String, Object> product) {
+        Object cats = product.get("categories");
+        Set<String> result = new LinkedHashSet<>();
+        if (cats == null) {
+            return result;
         }
-        return "fatsecret";
+        if (cats instanceof Array) {
+            try {
+                Object[] arr = (Object[]) ((Array) cats).getArray();
+                for (Object item : arr) {
+                    if (item != null && !item.toString().isBlank()) {
+                        result.add(item.toString().toLowerCase().trim());
+                    }
+                }
+            } catch (Exception e) {
+                return result;
+            }
+            return result;
+        }
+        if (cats instanceof List) {
+            for (Object item : (List<?>) cats) {
+                if (item != null && !item.toString().isBlank()) {
+                    result.add(item.toString().toLowerCase().trim());
+                }
+            }
+        }
+        return result;
+    }
+
+    private Array toSqlTextArray(Object value) {
+        if (value == null) {
+            return null;
+        }
+        List<?> list;
+        if (value instanceof List) {
+            list = (List<?>) value;
+        } else {
+            return null;
+        }
+        if (list.isEmpty()) {
+            return null;
+        }
+        try {
+            String[] arr = new String[list.size()];
+            for (int i = 0; i < list.size(); i++) {
+                arr[i] = list.get(i).toString();
+            }
+            return db.execute((ConnectionCallback<Array>) conn -> conn.createArrayOf("text", arr));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private BigDecimal numNode(JsonNode node, String field) {
@@ -799,21 +890,82 @@ public class RecommendationService {
         }
     }
 
-    private String categoryToHint(String category) {
-        if (category == null || category.isBlank()) {
-            return "";
-        }
-        String slug;
-        if (category.contains(":")) {
-            slug = category.substring(category.lastIndexOf(':') + 1);
+    private static final Set<String> GENERIC_CATEGORIES = Set.of(
+            "snacks", "beverages", "foods", "other", "misc", "general",
+            "frozen foods", "canned foods", "condiments", "prepared foods");
+
+    private String resolveProductType(Map<String, Object> scanned, String gtin) {
+        String productType;
+        if (scanned.get("product_type") != null) {
+            productType = scanned.get("product_type").toString();
         } else {
-            slug = category;
+            productType = null;
         }
-        String hint = slug.replace('-', ' ').trim().toLowerCase();
-        if (GENERIC_CATEGORIES.contains(hint)) {
-            return "";
+
+        if (productType == null) {
+            String scannedGtin;
+            if (scanned.get("gtin") != null) {
+                scannedGtin = scanned.get("gtin").toString();
+            } else {
+                scannedGtin = null;
+            }
+            String scannedFoodId;
+            if (scanned.get("food_id") != null) {
+                scannedFoodId = scanned.get("food_id").toString();
+            } else {
+                scannedFoodId = null;
+            }
+            String category;
+            if (scanned.get("category") != null) {
+                category = scanned.get("category").toString();
+            } else {
+                category = null;
+            }
+            usdaService.enrichFatSecretProduct(scannedGtin, scannedFoodId, category);
+            if (scannedGtin != null) {
+                List<Map<String, Object>> rows = db.queryForList(
+                        "SELECT product_type FROM fatsecret_products WHERE gtin = ?", scannedGtin);
+                if (!rows.isEmpty() && rows.getFirst().get("product_type") != null) {
+                    productType = rows.getFirst().get("product_type").toString();
+                }
+            }
+            if (productType == null && scannedFoodId != null) {
+                List<Map<String, Object>> rows = db.queryForList(
+                        "SELECT product_type FROM fatsecret_products WHERE food_id = ?", scannedFoodId);
+                if (!rows.isEmpty() && rows.getFirst().get("product_type") != null) {
+                    productType = rows.getFirst().get("product_type").toString();
+                }
+            }
         }
-        return hint;
+
+        return productType;
+    }
+
+    private double[] nutritionVectorForCriteria(Map<String, Object> product, String criteria) {
+        switch (criteria) {
+            case "sugar":
+                return new double[] {
+                        toDouble(product.get("total_fat")),
+                        toDouble(product.get("protein")),
+                        toDouble(product.get("sodium")) / 100.0
+                };
+            case "sodium":
+                return new double[] {
+                        toDouble(product.get("calories")) / 10.0,
+                        toDouble(product.get("total_fat")),
+                        toDouble(product.get("protein")),
+                        toDouble(product.get("total_sugars"))
+                };
+            case "calories":
+                return new double[] {
+                        toDouble(product.get("total_fat")),
+                        toDouble(product.get("protein")),
+                        toDouble(product.get("total_sugars")),
+                        toDouble(product.get("sodium")) / 100.0
+                };
+            default:
+                return nutritionVector(product);
+        }
     }
 
     private double[] nutritionVector(Map<String, Object> product) {
@@ -830,9 +982,43 @@ public class RecommendationService {
         double sum = 0;
         for (int i = 0; i < a.length; i++) {
             double diff = a[i] - b[i];
-            sum += diff * diff;
+            sum = sum + diff * diff;
         }
         return Math.sqrt(sum);
+    }
+
+    private String deriveCandidateProductType(Map<String, Object> candidate) {
+        String category;
+        if (candidate.get("category") != null) {
+            category = candidate.get("category").toString();
+        } else {
+            category = null;
+        }
+        return UsdaService.deriveProductType(category);
+    }
+
+    private boolean isLiquidServing(String serving) {
+        if (serving == null) {
+            return false;
+        }
+        String lower = serving.toLowerCase();
+        return lower.contains("fl oz") || lower.contains("bottle")
+                || lower.contains("can") || lower.contains("liter")
+                || (lower.contains("ml") && !lower.contains("small"));
+    }
+
+    private boolean isNonLiquidServing(String serving) {
+        if (serving == null) {
+            return false;
+        }
+        String lower = serving.toLowerCase();
+        return lower.contains("bar") || lower.contains("scoop")
+                || lower.contains("tbsp") || lower.contains("tsp")
+                || lower.contains("piece") || lower.contains("tablet")
+                || lower.contains("capsule") || lower.contains("packet")
+                || lower.contains("package") || lower.contains("slice")
+                || lower.contains("cookie") || lower.contains("bag")
+                || lower.matches(".*\\bpack\\b.*");
     }
 
     private double toDouble(Object val) {

@@ -19,3 +19,7 @@ fatsecret:
 openfoodfacts:
   api-base-url: https://world.openfoodfacts.org/api/v2/product
   user-agent: SwapSmart/1.0 (capstone project - daniel@csumb.edu)
+
+usda:
+  api-key: ${USDA_API_KEY}
+  api-base-url: https://api.nal.usda.gov/fdc/v1

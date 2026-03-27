@@ -69,18 +69,8 @@ public class ProductService {
         if (product != null) {
             System.out.println("FatSecret API");
             cacheFatSecretProduct(gtin, product);
-            String fsCategory;
-            if (product.get("category") != null) {
-                fsCategory = product.get("category").toString();
-            } else {
-                fsCategory = null;
-            }
-            String foodId;
-            if (product.get("food_id") != null) {
-                foodId = product.get("food_id").toString();
-            } else {
-                foodId = null;
-            }
+            String fsCategory = str(product, "category");
+            String foodId = str(product, "food_id");
             usdaService.enrichFatSecretProduct(gtin, foodId, fsCategory);
             List<Map<String, Object>> enriched = db.queryForList(
                     "SELECT product_type, usda_category FROM fatsecret_products WHERE gtin = ?", gtin);
@@ -95,12 +85,7 @@ public class ProductService {
         product = usdaService.lookupByGtin(gtin);
         if (product != null) {
             System.out.println("USDA API/Cache");
-            String usdaCategory;
-            if (product.get("category") != null) {
-                usdaCategory = product.get("category").toString();
-            } else {
-                usdaCategory = null;
-            }
+            String usdaCategory = str(product, "category");
             product.put("product_type", UsdaService.deriveProductType(usdaCategory));
             return withSource(product, "usda");
         }
@@ -597,6 +582,11 @@ public class ProductService {
             System.err.println("Error fetching food details: " + e.getMessage());
             return null;
         }
+    }
+
+    private static String str(Map<String, Object> map, String key) {
+        Object v = map.get(key);
+        return v != null ? v.toString() : null;
     }
 
 }

@@ -1,5 +1,7 @@
 package com.SwapSmart.api;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -18,6 +20,8 @@ import org.springframework.jdbc.core.ConnectionCallback;
 
 @Service
 public class ProductService {
+    private static final Logger log = LoggerFactory.getLogger(ProductService.class);
+
     private final JdbcTemplate db;
     private final NamedParameterJdbcTemplate namedDb;
     private final RestClient http;
@@ -46,28 +50,22 @@ public class ProductService {
         this.usdaService = usdaService;
     }
 
-    // This the main focus cache first then API lookups.
-    // FatSecret Cache and API main for both categories
     public Map<String, Object> lookupProduct(String gtin) {
-
-        // 1. Check our FatSecret cache first
         Map<String, Object> product = findCached("fatsecret_products", "gtin", gtin);
         if (product != null) {
-            System.out.println("FatSecret CACHE (by gtin)");
+            log.info("FatSecret CACHE (by gtin)");
             return withSource(product, "fatsecret");
         }
 
-        // 2. Check OFF cache
         product = findCached("openfoodfacts_products", "gtin", gtin);
         if (product != null) {
-            System.out.println("Open Food Facts CACHE");
+            log.info("Open Food Facts CACHE");
             return withSource(product, "openfoodfacts");
         }
 
-        // 3. Actually call FatSecret API
         product = fetchFromFatSecret(gtin);
         if (product != null) {
-            System.out.println("FatSecret API");
+            log.info("FatSecret API");
             cacheFatSecretProduct(gtin, product);
             String fsCategory = str(product, "category");
             String foodId = str(product, "food_id");
@@ -81,32 +79,24 @@ public class ProductService {
             return withSource(product, "fatsecret");
         }
 
-        // 4. Try USDA FoodData Central
         product = usdaService.lookupByGtin(gtin);
         if (product != null) {
-            System.out.println("USDA API/Cache");
+            log.info("USDA API/Cache");
             String usdaCategory = str(product, "category");
             product.put("product_type", UsdaService.deriveProductType(usdaCategory));
             return withSource(product, "usda");
         }
 
-        // 5. Try Open Food Facts as last fallback
         product = fetchFromOpenFoodFacts(gtin);
         if (product != null) {
-            System.out.println("Open Food Facts API");
+            log.info("Open Food Facts API");
             cacheProduct("openfoodfacts_products", gtin, product);
             return withSource(product, "openfoodfacts");
         }
 
-        // Not found anywhere
         return null;
     }
 
-    // Cache lookup
-
-    // Checks if we already have this product saved in our DB.
-    // The table and column params let us reuse this for both fatsecret and OFF
-    // tables.
     private Map<String, Object> findCached(String table, String column, String value) {
         if (value == null || value.isBlank()) {
             return null;
@@ -121,15 +111,9 @@ public class ProductService {
         return rows.getFirst();
     }
 
-    // FatSecret cache write — the tricky part is deduplication
-    //
-    // Here's the problem: when RecommendationService searches for "granola",
-    // it caches ~99 products( I don't remember if I left it 99 or 100) by food_id
-    // with gtin=NULL. Later when someone
-    // scans one of those products by barcode, we don't want to create a
-    // duplicate row. Instead we find the existing food_id row and add the
-    // gtin to it.
-
+    // Deduplication: RecommendationService caches products by food_id with gtin=NULL.
+    // When a barcode scan finds the same product, we merge the gtin into the existing row
+    // instead of creating a duplicate.
     private void cacheFatSecretProduct(String gtin, Map<String, Object> product) {
         product.put("gtin", gtin);
         String foodId = (String) product.get("food_id");
@@ -165,15 +149,11 @@ public class ProductService {
                         foodId);
 
                 if (updated > 0) {
-                    System.out.println("  Merged barcode " + gtin
-                            + " into existing food_id " + foodId);
+                    log.info("Merged barcode {} into existing food_id {}", gtin, foodId);
                     return; // done, no duplicate created
                 }
             }
 
-            // No existing row to merge into, just insert fresh.
-            // Using named params here because there's a way too many columns and
-            // ? would be impossible to keep track of.
             Object rawCatsInsert = product.get("categories");
             if (rawCatsInsert instanceof List) {
                 product.put("categories", toSqlTextArray((List<?>) rawCatsInsert));
@@ -197,17 +177,13 @@ public class ProductService {
                             + "  image_url = COALESCE(EXCLUDED.image_url, fatsecret_products.image_url)",
                     product);
         } catch (Exception e) {
-            System.err.println("FatSecret cache write failed: " + e.getMessage());
+            log.error("FatSecret cache write failed: {}", e.getMessage());
         }
     }
 
-    // Simpler cache write for OFF products
     private void cacheProduct(String table, String gtin, Map<String, Object> product) {
         product.put("gtin", gtin);
 
-        // Maybe I should have written this as a final value instead... I'll think about
-        // this
-        // I'm not even sure if it will work.
         String cols = "gtin, name, brand, category, serving_size, calories, "
                 + "total_fat, saturated_fat, trans_fat, cholesterol, sodium, "
                 + "total_carbs, dietary_fiber, total_sugars, added_sugars, protein, "
@@ -217,8 +193,6 @@ public class ProductService {
                 + ":total_carbs, :dietary_fiber, :total_sugars, :added_sugars, :protein, "
                 + "CAST(:raw_json AS jsonb)";
 
-        // OFF (or right when I say this I mean OpenFoodFacts I got tired writing it)
-        // has an extra column for their A-E nutrition grade
         if (table.equals("openfoodfacts_products")) {
             cols += ", nutrition_grade";
             vals += ", :nutrition_grade";
@@ -231,14 +205,10 @@ public class ProductService {
                             + "ON CONFLICT (gtin) DO NOTHING",
                     product);
         } catch (Exception e) {
-            System.err.println("Cache write failed: " + e.getMessage());
+            log.error("Cache write failed: {}", e.getMessage());
         }
     }
 
-    // FatSecret API — barcode lookup
-    // Docs: https://platform.fatsecret.com/docs/v2/food.find_id_for_barcode
-    // This endpoint takes a barcode and gives back the full food object
-    // including food_id, nutrition data, images, categories, really everything.
     private Map<String, Object> fetchFromFatSecret(String gtin) {
         try {
             String token = getToken();
@@ -246,13 +216,7 @@ public class ProductService {
                 return null;
             }
 
-            // FatSecret wants GTIN-13 (13 digits). Phone scanners usually give us
-            // UPC-A (12 digits), so we pad with a leading zero.
-            // "016000437791" (12 chars) becomes "0016000437791" (13 chars)
-            // there are cases where this might not work
-            // One of them I had to pad a 0 on the end and one in the beginning. So that's
-            // something we might
-            // have to address later.
+            // FatSecret requires GTIN-13; pad UPC-A (12 digits) with a leading zero
             String gtin13 = String.format("%13s", gtin).replace(' ', '0');
 
             String body = http.get()
@@ -269,32 +233,24 @@ public class ProductService {
 
             JsonNode root = JsonMapper.shared().readTree(body);
 
-            // FatSecret returns {"error": {...}} if the barcode isn't in their database
             if (root.has("error")) {
                 return null;
             }
 
             return parseFatSecret(root, body);
         } catch (Exception e) {
-            System.err.println("FatSecret error: " + e.getMessage());
+            log.error("FatSecret error: {}", e.getMessage());
             return null;
         }
     }
 
-    // OAuth2 token — FatSecret requires this on every request.
-    // We cache it and only refresh when it's about to expire.
-    // Package-private so RecommendationService can also use it for search calls
-    // Otherwise it will break reocomendation service. I spent to long trying to
-    // figure out why it wasn't working
+    // Package-private so RecommendationService can reuse the same token
     String getToken() {
-        // If it's still valid then we just reuse it.
         if (fsToken != null && Instant.now().isBefore(fsTokenExpiry)) {
             return fsToken;
         }
 
         try {
-            // Standard OAuth2 client credentials flow:
-            // Base64-encode "clientId:clientSecret", POST it to the token URL
             String encoded = Base64.getEncoder().encodeToString(
                     (fsClientId + ":" + fsClientSecret).getBytes());
 
@@ -308,35 +264,21 @@ public class ProductService {
             JsonNode tokenJson = JsonMapper.shared().readTree(body);
             fsToken = tokenJson.get("access_token").asString();
 
-            // Refresh 60 seconds early so we never use an expired token
-            // We might want to do something differnt here. Just as a failsafe just in case
-            // something
-            // goes terribly wrong
+            // Refresh 60s early to avoid using an expired token
             fsTokenExpiry = Instant.now().plusSeconds(tokenJson.get("expires_in").asInt() - 60);
 
             return fsToken;
         } catch (Exception e) {
-            System.err.println("FatSecret token error: " + e.getMessage());
+            log.error("FatSecret token error: {}", e.getMessage());
             return null;
         }
     }
-
-    // FatSecret response parsing
-    //
-    // Their API returns deeply nested JSON. We pull out just the fields we
-    // need and flatten them into a Map that matches our DB columns.
-    //
-    // The response looks roughly like:
-    // { "food": { "food_id": "60938", "food_name": "Granola",
-    // "servings": { "serving": [{ "calories": "210", "sugar": "16" }] } } }
 
     private Map<String, Object> parseFatSecret(JsonNode root, String rawJson) {
         JsonNode food = root.path("food");
         JsonNode servings = food.path("servings").path("serving");
         JsonNode subCats = food.path("food_sub_categories").path("food_sub_category");
 
-        // Products can have multiple servings (e.g. "1 cup", "100g", "1 bar").
-        // We want the one flagged as default, otherwise just grab the first one.
         JsonNode serving = null;
         if (servings.isArray()) {
             for (JsonNode s : servings) {
@@ -349,8 +291,10 @@ public class ProductService {
                 serving = servings.get(0);
             }
         } else {
-            // Sometimes FatSecret returns a single object instead of an array
             serving = servings;
+        }
+        if (serving == null) {
+            serving = JsonMapper.shared().createObjectNode();
         }
 
         List<String> categoriesList = new ArrayList<>();
@@ -374,15 +318,12 @@ public class ProductService {
             category = categoriesList.get(0);
         }
 
-        // Grab the first product image if they gave us any (usually there is not image
-        // which will have to be addressed)
         String imageUrl = null;
         JsonNode images = food.path("food_images").path("food_image");
         if (images.isArray() && !images.isEmpty()) {
             imageUrl = images.get(0).path("image_url").asString(null);
         }
 
-        // Build the product map, keys should match our DB column names exactly
         Map<String, Object> product = new HashMap<>();
         product.put("food_id", food.path("food_id").asString(null));
         product.put("name", food.path("food_name").asString(""));
@@ -402,36 +343,30 @@ public class ProductService {
         product.put("total_sugars", num(serving, "sugar"));
         product.put("added_sugars", num(serving, "added_sugars"));
         product.put("protein", num(serving, "protein"));
-        product.put("raw_json", rawJson); // keep the raw response for debugging
+        product.put("raw_json", rawJson);
         return product;
     }
 
-    // Open Food Facts — free fallback API
-    // https://world.openfoodfacts.org/data
-    // Community-maintained, so data quality varies a lot
     private Map<String, Object> fetchFromOpenFoodFacts(String gtin) {
         try {
             String body = http.get()
                     .uri(offApiBase + "/{gtin}.json", gtin)
-                    .header("User-Agent", offUserAgent) // OFF requires this
+                    .header("User-Agent", offUserAgent)
                     .retrieve().body(String.class);
 
             JsonNode root = JsonMapper.shared().readTree(body);
 
-            // OFF uses status: 1 = found, 0 = not found
             if (root.path("status").asInt(0) != 1) {
                 return null;
             }
 
             return parseOpenFoodFacts(root, body);
         } catch (Exception e) {
-            System.err.println("OFF error: " + e.getMessage());
+            log.error("OFF error: {}", e.getMessage());
             return null;
         }
     }
 
-    // OFF uses completely different field names than FatSecret so we have to
-    // map everything over to our schema
     private Map<String, Object> parseOpenFoodFacts(JsonNode root, String rawJson) {
         JsonNode prod = root.path("product");
         JsonNode n = prod.path("nutriments");
@@ -443,8 +378,6 @@ public class ProductService {
         product.put("image_url", prod.path("image_url").asString(null));
         product.put("serving_size", prod.path("serving_size").asString(null));
 
-        // OFF gives us per-serving AND per-100g values.
-        // pick() tries per-serving first, falls back to per-100g.
         product.put("calories", pick(n, "energy-kcal_serving", "energy-kcal_100g"));
         product.put("total_fat", pick(n, "fat_serving", "fat_100g"));
         product.put("saturated_fat", pick(n, "saturated-fat_serving", "saturated-fat_100g"));
@@ -461,12 +394,6 @@ public class ProductService {
         return product;
     }
 
-    // Helpers. these just extract values from JSON without blowing up (i.e.
-    // creating problems or throwing errors)
-    // if something's missing or weird. They return null instead of crashing.
-
-    // Pulls a numeric value out of a JSON node. FatSecret sends numbers as
-    // strings ("16.00" not 16.00) so we have to parse them.
     private BigDecimal num(JsonNode node, String field) {
         JsonNode value = node.path(field);
         if (value.isMissingNode() || value.isNull()) {
@@ -479,9 +406,6 @@ public class ProductService {
         }
     }
 
-    // Tries multiple field names and returns the first one that has a value.
-    // Used for OFF where nutrition can be per-serving or per-100g.
-    // String... means you can pass in as many field names as you want.
     private BigDecimal pick(JsonNode node, String... fields) {
         for (String field : fields) {
             BigDecimal value = num(node, field);
@@ -492,8 +416,6 @@ public class ProductService {
         return null;
     }
 
-    // Adds a "source" tag so the frontend knows where the data came from
-    // Used for testing mainly. We might want to remove this later.
     private Map<String, Object> withSource(Map<String, Object> product, String source) {
         product.put("source", source);
         return product;
@@ -514,18 +436,18 @@ public class ProductService {
             return null;
         }
     }
-    ///search stuff
     public List<Map<String, Object>> searchProducts(String query) {
         try {
             String token = getToken();
-            if (token == null) return List.of();
+            if (token == null) {
+                return List.of();
+            }
 
             String body = http.get()
                     .uri(fsApiBase + "/foods/search/v1?search_expression={query}&page_number=0&max_results=10&format=json", query)
                     .header("Authorization", "Bearer " + token)
                     .retrieve()
                     .body(String.class);
-            ///System.out.println(body);
 
             JsonNode root = JsonMapper.shared().readTree(body);
             JsonNode foods = root.path("foods").path("food");
@@ -535,16 +457,16 @@ public class ProductService {
             if (foods.isArray()) {
                 for (JsonNode food : foods) {
                     Map<String, Object> item = new HashMap<>();
-                    item.put("id", food.path("food_id").asText());
-                    item.put("name", food.path("food_name").asText());
-                    item.put("brand", food.path("brand_name").asText(null));
+                    item.put("id", food.path("food_id").asString());
+                    item.put("name", food.path("food_name").asString());
+                    item.put("brand", food.path("brand_name").asString(null));
                     results.add(item);
                 }
             }
             return results;
 
         } catch (Exception e) {
-            System.err.println("Search error: " + e.getMessage());
+            log.error("Search error: {}", e.getMessage());
             return List.of();
         }
     }
@@ -552,7 +474,9 @@ public class ProductService {
     public Map<String, Object> getDetails(String foodId) {
         try {
             String token = getToken();
-            if (token == null) return null;
+            if (token == null) {
+                return null;
+            }
 
             String body = http.get()
                     .uri(fsApiBase + "/server.api?method=food.get.v2&food_id={id}&format=json", foodId)
@@ -563,23 +487,28 @@ public class ProductService {
             JsonNode root = JsonMapper.shared().readTree(body);
             JsonNode food = root.path("food");
             JsonNode servings = food.path("servings").path("serving");
-            JsonNode serving = servings.isArray() ? servings.get(0) : servings;
+            JsonNode serving;
+            if (servings.isArray()) {
+                serving = servings.get(0);
+            } else {
+                serving = servings;
+            }
 
             Map<String, Object> result = new HashMap<>();
             result.put("id", foodId);
-            result.put("name", food.path("food_name").asText(null));
-            result.put("brand", food.path("brand_name").asText(null));
-            result.put("serving_size", serving.path("serving_description").asText(null));
-            result.put("calories", serving.path("calories").asText(null));
-            result.put("fat", serving.path("fat").asText(null));
-            result.put("carbs", serving.path("carbohydrate").asText(null));
-            result.put("protein", serving.path("protein").asText(null));
-            result.put("sugar", serving.path("sugar").asText(null));
+            result.put("name", food.path("food_name").asString(null));
+            result.put("brand", food.path("brand_name").asString(null));
+            result.put("serving_size", serving.path("serving_description").asString(null));
+            result.put("calories", serving.path("calories").asString(null));
+            result.put("fat", serving.path("fat").asString(null));
+            result.put("carbs", serving.path("carbohydrate").asString(null));
+            result.put("protein", serving.path("protein").asString(null));
+            result.put("sugar", serving.path("sugar").asString(null));
 
             return result;
 
         } catch (Exception e) {
-            System.err.println("Error fetching food details: " + e.getMessage());
+            log.error("Error fetching food details: {}", e.getMessage());
             return null;
         }
     }

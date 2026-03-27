@@ -5,6 +5,8 @@ import java.math.RoundingMode;
 import java.sql.Array;
 import java.util.*;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -16,6 +18,8 @@ import tools.jackson.databind.json.JsonMapper;
 
 @Service
 public class RecommendationService {
+    private static final Logger log = LoggerFactory.getLogger(RecommendationService.class);
+
     private final ProductService productService;
     private final JdbcTemplate db;
     private final NamedParameterJdbcTemplate namedDb;
@@ -104,7 +108,7 @@ public class RecommendationService {
         if ("sugar".equals(criteria)) {
             List<Map<String, Object>> cached = getCachedAlternatives(gtin);
             if (cached != null) {
-                System.out.println("Recommendations from CACHE for gtin: " + gtin);
+                log.info("Recommendations from CACHE for gtin: {}", gtin);
                 return new RecommendationResult(scannedSummary, toRecommendationSummaries(cached), criteria);
             }
         }
@@ -131,7 +135,7 @@ public class RecommendationService {
         String searchQuery;
         if (productType != null && !productType.isBlank()) {
             searchQuery = productType;
-            System.out.println("Product-type search: \"" + searchQuery + "\" criteria=" + criteria);
+            log.info("Product-type search: \"{}\" criteria={}", searchQuery, criteria);
         } else {
             Set<String> scannedCategories = getCategories(scanned);
             if (scannedCategories.isEmpty() && scanned.get("category") != null) {
@@ -151,13 +155,13 @@ public class RecommendationService {
             }
             String category = Objects.toString(scanned.get("category"), "");
             searchQuery = buildSearchQuery(nameRaw.toString(), category, !usableCategories.isEmpty());
-            System.out.println("Name-token search: \"" + searchQuery + "\" criteria=" + criteria);
+            log.info("Name-token search: \"{}\" criteria={}", searchQuery, criteria);
         }
 
         Map<String, Map<String, Object>> seenById = new LinkedHashMap<>();
 
         if (!brandRaw.isBlank()) {
-            System.out.println("Brand search: \"" + brandRaw + "\"");
+            log.info("Brand search: \"{}\"", brandRaw);
             for (Map<String, Object> c : fetchAllCandidates(brandRaw, gtin)) {
                 seenById.put(candidateId(c), c);
             }
@@ -165,7 +169,7 @@ public class RecommendationService {
 
         if (productType != null) {
             List<Map<String, Object>> dbCandidates = getCandidatesFromDb(productType, field, gtin);
-            System.out.println("DB candidates for product_type=\"" + productType + "\": " + dbCandidates.size());
+            log.info("DB candidates for product_type=\"{}\": {}", productType, dbCandidates.size());
             for (Map<String, Object> c : dbCandidates) {
                 seenById.putIfAbsent(candidateId(c), c);
             }
@@ -181,7 +185,7 @@ public class RecommendationService {
         long distinctBrands = distinctBrandSet.size();
         boolean isDiverse = seenById.size() >= MAX_RECOMMENDATIONS * 4 && distinctBrands >= MAX_RECOMMENDATIONS;
         if (!isDiverse) {
-            System.out.println("API search: \"" + searchQuery + "\"");
+            log.info("API search: \"{}\"", searchQuery);
             for (Map<String, Object> c : fetchAllCandidates(searchQuery, gtin)) {
                 seenById.putIfAbsent(candidateId(c), c);
             }
@@ -257,8 +261,7 @@ public class RecommendationService {
             saveAlternatives(gtin, productType, scannedValue, recommendations);
         }
 
-        System.out.println("Returning " + recommendations.size()
-                + " recommendations (" + criteria + ") for gtin: " + gtin);
+        log.info("Returning {} recommendations ({}) for gtin: {}", recommendations.size(), criteria, gtin);
         return new RecommendationResult(scannedSummary, toRecommendationSummaries(recommendations), criteria);
     }
 
@@ -268,7 +271,7 @@ public class RecommendationService {
 
         for (int page = 0; page < MAX_PAGES; page++) {
             if (page > 0 && allCandidates.size() >= totalResults) {
-                System.out.println("No more pages — stopping after page " + page);
+                log.debug("No more pages — stopping after page {}", page);
                 break;
             }
 
@@ -278,10 +281,8 @@ public class RecommendationService {
             }
 
             totalResults = result.totalResults();
-            System.out.println("FatSecret search \"" + query + "\": "
-                    + "page " + page + ", total_results=" + totalResults
-                    + ", fetching up to "
-                    + Math.min(totalResults, PAGE_SIZE * MAX_PAGES) + " candidates");
+            log.info("FatSecret search \"{}\": page {}, total_results={}, fetching up to {} candidates",
+                    query, page, totalResults, Math.min(totalResults, PAGE_SIZE * MAX_PAGES));
 
             if (result.foods().isEmpty()) {
                 break;
@@ -299,7 +300,7 @@ public class RecommendationService {
             }
         }
 
-        System.out.println("Total candidates fetched: " + allCandidates.size());
+        log.info("Total candidates fetched: {}", allCandidates.size());
         return allCandidates;
     }
 
@@ -324,13 +325,12 @@ public class RecommendationService {
                     .retrieve()
                     .body(String.class);
             if (body == null || body.isBlank()) {
-                System.err.println("FatSecret search page " + pageNumber + ": empty response body");
+                log.warn("FatSecret search page {}: empty response body", pageNumber);
                 return new SearchPage(0, List.of());
             }
             if (!body.trim().startsWith("{")) {
-                System.err.println("FatSecret search page " + pageNumber
-                        + ": unexpected response (not JSON): "
-                        + body.substring(0, Math.min(300, body.length())));
+                log.warn("FatSecret search page {}: unexpected response (not JSON): {}",
+                        pageNumber, body.substring(0, Math.min(300, body.length())));
                 return new SearchPage(0, List.of());
             }
 
@@ -349,13 +349,11 @@ public class RecommendationService {
                 }
             }
 
-            System.out.println("  Page " + pageNumber + ": fetched "
-                    + foods.size() + " valid items (of " + totalResults + " total)");
+            log.debug("Page {}: fetched {} valid items (of {} total)", pageNumber, foods.size(), totalResults);
             return new SearchPage(totalResults, foods);
 
         } catch (Exception e) {
-            System.err.println("FatSecret v5 search error (page "
-                    + pageNumber + "): " + e.getMessage());
+            log.error("FatSecret v5 search error (page {}): {}", pageNumber, e.getMessage());
             return null;
         }
     }
@@ -494,8 +492,7 @@ public class RecommendationService {
                         params);
             }
         } catch (Exception e) {
-            System.err.println("Side-cache write failed for gtin="
-                    + gtin + " food_id=" + foodId + ": " + e.getMessage());
+            log.error("Side-cache write failed for gtin={} food_id={}: {}", gtin, foodId, e.getMessage());
         }
     }
 
@@ -584,7 +581,7 @@ public class RecommendationService {
             }
             return db.queryForList(sql, productType, gtinParam);
         } catch (Exception e) {
-            System.err.println("DB candidate query failed: " + e.getMessage());
+            log.error("DB candidate query failed: {}", e.getMessage());
             return Collections.emptyList();
         }
     }
@@ -642,7 +639,7 @@ public class RecommendationService {
             return results;
 
         } catch (Exception e) {
-            System.err.println("Alternatives cache read failed: " + e.getMessage());
+            log.error("Alternatives cache read failed: {}", e.getMessage());
             return null;
         }
     }
@@ -658,7 +655,7 @@ public class RecommendationService {
             String altGtin = (String) alt.get("gtin");
 
             if (altFoodId == null || altFoodId.isBlank()) {
-                System.err.println("Skipping alternative with no food_id: " + alt.get("name"));
+                log.warn("Skipping alternative with no food_id: {}", alt.get("name"));
                 continue;
             }
 
@@ -695,7 +692,7 @@ public class RecommendationService {
                         sugarDiff, reductionPct, productType, rank);
 
             } catch (Exception e) {
-                System.err.println("Alternatives save failed for food_id=" + altFoodId + ": " + e.getMessage());
+                log.error("Alternatives save failed for food_id={}: {}", altFoodId, e.getMessage());
             }
         }
     }

@@ -1,5 +1,7 @@
 package com.SwapSmart.api;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -13,6 +15,8 @@ import java.util.*;
 
 @Service
 public class UsdaService {
+    private static final Logger log = LoggerFactory.getLogger(UsdaService.class);
+
     private final JdbcTemplate db;
     private final NamedParameterJdbcTemplate namedDb;
     private final RestClient http;
@@ -148,13 +152,13 @@ public class UsdaService {
         List<Map<String, Object>> rows = db.queryForList(
                 "SELECT * FROM usda_products WHERE gtin = ?", gtin);
         if (!rows.isEmpty()) {
-            System.out.println("USDA CACHE");
+            log.info("USDA CACHE");
             return rows.getFirst();
         }
 
         Map<String, Object> product = fetchFromUsda(gtin);
         if (product != null) {
-            System.out.println("USDA API");
+            log.info("USDA API");
             cacheUsdaProduct(gtin, product);
         }
         return product;
@@ -226,7 +230,7 @@ public class UsdaService {
             }
             return null;
         } catch (Exception e) {
-            System.err.println("USDA API error for gtin=" + gtin + ": " + e.getMessage());
+            log.error("USDA API error for gtin={}: {}", gtin, e.getMessage());
             return null;
         }
     }
@@ -320,7 +324,7 @@ public class UsdaService {
                             + "ON CONFLICT (gtin) DO NOTHING",
                     product);
         } catch (Exception e) {
-            System.err.println("USDA cache write failed for gtin=" + gtin + ": " + e.getMessage());
+            log.error("USDA cache write failed for gtin={}: {}", gtin, e.getMessage());
         }
     }
 }

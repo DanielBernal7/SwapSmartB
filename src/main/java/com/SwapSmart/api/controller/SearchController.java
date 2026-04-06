@@ -17,7 +17,14 @@ public class SearchController {
     }
 
     @GetMapping(value = "/search", produces = "application/json")
-    public List<Map<String, Object>> search(@RequestParam String query) {
-        return productService.searchProducts(query);
+    public List<Map<String, Object>> search(
+        @RequestParam String query,
+        @RequestParam(required = false) String category) {
+        return productService.searchProducts(query, category);
+    }
+
+    @GetMapping(value = "/categories", produces = "application/json")
+    public List<Map<String, Object>> getCategories() {
+        return productService.getFoodCategories();
     }
 }

@@ -20,6 +20,25 @@ public class ProductService {
     private final NamedParameterJdbcTemplate namedDb;
     private final RestClient http;
 
+    /// FILTERING KEYWORDS!!!! 
+    private static final Map<String, List<String>> CATEGORY_KEYWORDS = Map.ofEntries(
+    Map.entry("dairy", List.of("milk", "cheese", "yogurt", "butter", "cream", "ice cream", "custard")),
+    Map.entry("fruit", List.of("apple", "banana", "orange", "grape", "pear", "berry", "melon", "peach")),
+    Map.entry("meat", List.of("beef", "chicken", "pork", "turkey", "bacon", "ham", "sausage")),
+    Map.entry("snacks", List.of("chips", "cracker", "popcorn", "pretzel", "granola", "bar")),
+    Map.entry("beverages", List.of("juice", "soda", "coffee", "tea", "smoothie", "drink")),
+    Map.entry("vegetables", List.of("carrot", "broccoli", "lettuce", "spinach", "pepper", "onion", "tomato")),
+    Map.entry("grains", List.of("rice", "pasta", "bread", "noodle", "oat", "cereal")),
+    Map.entry("sweets", List.of("cake", "cookie", "candy", "chocolate", "dessert", "brownie", "donut")),
+    Map.entry("seafood", List.of("fish", "salmon", "tuna", "shrimp", "crab", "lobster")),
+
+    // diets
+    Map.entry("gluten_free", List.of("gluten free", "rice", "corn", "quinoa")),
+    Map.entry("dairy_free", List.of("dairy free", "almond milk", "soy milk", "oat milk")),
+    Map.entry("grain_free", List.of("grain free", "almond flour", "coconut flour")),
+    Map.entry("sugar_free", List.of("sugar free", "no sugar", "zero sugar", "diet"))
+);
+
     @Value("${fatsecret.client-id}")
     private String fsClientId;
     @Value("${fatsecret.client-secret}")
@@ -277,21 +296,18 @@ public class ProductService {
     }
 
     ///search stuff
-    public List<Map<String, Object>> searchProducts(String query) {
+    public List<Map<String, Object>> searchProducts(String query, String categoryId) {
         try {
             String token = getToken();
             if (token == null) return List.of();
-
             String body = http.get()
-                    .uri(fsApiBase + "/foods/search/v1?search_expression={query}&page_number=0&max_results=10&format=json", query)
+                    .uri(fsApiBase + "/foods/search/v1?search_expression={query}&page_number=0&max_results=50&format=json", query)
                     .header("Authorization", "Bearer " + token)
                     .retrieve()
                     .body(String.class);
-            ///System.out.println(body);
 
             JsonNode root = JsonMapper.shared().readTree(body);
             JsonNode foods = root.path("foods").path("food");
-
             List<Map<String, Object>> results = new ArrayList<>();
 
             if (foods.isArray()) {
@@ -303,7 +319,29 @@ public class ProductService {
                     results.add(item);
                 }
             }
-            return results;
+
+            if (categoryId == null || categoryId.isEmpty()) {
+                return results;
+            }
+            ///filter stuff
+            List<Map<String, Object>> filtered = new ArrayList<>();
+            List<String> keywords = CATEGORY_KEYWORDS.get(categoryId.toLowerCase());
+            if (keywords == null) {
+                return results;
+            }
+
+            for (Map<String, Object> item : results) {
+                String name = (String) item.get("name");
+                if (name == null) continue;
+
+                for (String keyword : keywords) {
+                    if (name.toLowerCase().contains(keyword)) {
+                        filtered.add(item);
+                        break;
+                    }
+                }
+            }
+            return filtered;
 
         } catch (Exception e) {
             System.err.println("Search error: " + e.getMessage());
@@ -321,12 +359,10 @@ public class ProductService {
                     .header("Authorization", "Bearer " + token)
                     .retrieve()
                     .body(String.class);
-
             JsonNode root = JsonMapper.shared().readTree(body);
-            JsonNode food = root.path("food");
+            JsonNode food = root.path("food");  
             JsonNode servings = food.path("servings").path("serving");
             JsonNode serving = servings.isArray() ? servings.get(0) : servings;
-
             Map<String, Object> result = new HashMap<>();
             result.put("id", foodId);
             result.put("name", food.path("food_name").asText(null));
@@ -337,7 +373,6 @@ public class ProductService {
             result.put("carbs", serving.path("carbohydrate").asText(null));
             result.put("protein", serving.path("protein").asText(null));
             result.put("sugar", serving.path("sugar").asText(null));
-
             return result;
 
         } catch (Exception e) {
@@ -345,5 +380,33 @@ public class ProductService {
             return null;
         }
     }
+    /// new ategories stuff yay!
+    public List<Map<String, Object>> getFoodCategories() {
+        try {
+            String token = getToken();
+            if (token == null) return List.of();
+            String body = http.get()
+                    .uri(fsApiBase + "/server.api?method=food_categories.get.v2&format=json")
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve()
+                    .body(String.class);
 
+            JsonNode root = JsonMapper.shared().readTree(body);
+            JsonNode categories = root.path("food_categories").path("food_category");
+            List<Map<String, Object>> results = new ArrayList<>();
+            if (categories.isArray()) {
+                for (JsonNode cat : categories) {
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("id", cat.path("food_category_id").asText());
+                    item.put("name", cat.path("food_category_name").asText());
+                    item.put("description", cat.path("food_category_description").asText(null));
+                    results.add(item);
+                }
+            }
+            return results;
+        } catch (Exception e) {
+            System.err.println("Category fetch error: " + e.getMessage());
+            return List.of();
+        }
+    }
 }

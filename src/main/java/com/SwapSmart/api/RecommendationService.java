@@ -132,30 +132,27 @@ public class RecommendationService {
 
         String brandRaw = Objects.toString(scanned.get("brand"), "");
 
-        String searchQuery;
+        Set<String> scannedCategories = getCategories(scanned);
+        if (scannedCategories.isEmpty() && scanned.get("category") != null) {
+            scannedCategories.add(scanned.get("category").toString().toLowerCase().trim());
+        }
+        Set<String> usableCategories = new LinkedHashSet<>();
+        for (String cat : scannedCategories) {
+            String norm;
+            if (cat.startsWith("en:")) {
+                norm = cat.substring(3).replace('-', ' ');
+            } else {
+                norm = cat;
+            }
+            if (!norm.isBlank() && !GENERIC_CATEGORIES.contains(norm)) {
+                usableCategories.add(norm);
+            }
+        }
+        String category = Objects.toString(scanned.get("category"), "");
+        String searchQuery = buildSearchQuery(nameRaw.toString(), category, !usableCategories.isEmpty());
+        log.info("Name-token search: \"{}\" criteria={}", searchQuery, criteria);
         if (productType != null && !productType.isBlank()) {
-            searchQuery = productType;
-            log.info("Product-type search: \"{}\" criteria={}", searchQuery, criteria);
-        } else {
-            Set<String> scannedCategories = getCategories(scanned);
-            if (scannedCategories.isEmpty() && scanned.get("category") != null) {
-                scannedCategories.add(scanned.get("category").toString().toLowerCase().trim());
-            }
-            Set<String> usableCategories = new LinkedHashSet<>();
-            for (String cat : scannedCategories) {
-                String norm;
-                if (cat.startsWith("en:")) {
-                    norm = cat.substring(3).replace('-', ' ');
-                } else {
-                    norm = cat;
-                }
-                if (!norm.isBlank() && !GENERIC_CATEGORIES.contains(norm)) {
-                    usableCategories.add(norm);
-                }
-            }
-            String category = Objects.toString(scanned.get("category"), "");
-            searchQuery = buildSearchQuery(nameRaw.toString(), category, !usableCategories.isEmpty());
-            log.info("Name-token search: \"{}\" criteria={}", searchQuery, criteria);
+            log.info("Product-type (DB only): \"{}\"", productType);
         }
 
         Map<String, Map<String, Object>> seenById = new LinkedHashMap<>();
@@ -175,20 +172,9 @@ public class RecommendationService {
             }
         }
 
-        Set<String> distinctBrandSet = new LinkedHashSet<>();
-        for (Map<String, Object> c : seenById.values()) {
-            String b = Objects.toString(c.get("brand"), "").toLowerCase().trim();
-            if (!b.isBlank()) {
-                distinctBrandSet.add(b);
-            }
-        }
-        long distinctBrands = distinctBrandSet.size();
-        boolean isDiverse = seenById.size() >= MAX_RECOMMENDATIONS * 4 && distinctBrands >= MAX_RECOMMENDATIONS;
-        if (!isDiverse) {
-            log.info("API search: \"{}\"", searchQuery);
-            for (Map<String, Object> c : fetchAllCandidates(searchQuery, gtin)) {
-                seenById.putIfAbsent(candidateId(c), c);
-            }
+        log.info("API search: \"{}\"", searchQuery);
+        for (Map<String, Object> c : fetchAllCandidates(searchQuery, gtin)) {
+            seenById.putIfAbsent(candidateId(c), c);
         }
 
         String scannedServing = Objects.toString(scanned.get("serving_size"), "");
@@ -202,7 +188,12 @@ public class RecommendationService {
                 continue;
             }
             BigDecimal val = toBigDecimal(raw.toString());
-            if (val == null || val.compareTo(scannedValue) >= 0) {
+            if (val == null) {
+                continue;
+            }
+            BigDecimal reduction = scannedValue.subtract(val);
+            BigDecimal minReduction = scannedValue.multiply(BigDecimal.valueOf(0.20));
+            if (reduction.compareTo(minReduction) < 0) {
                 continue;
             }
 
@@ -244,6 +235,8 @@ public class RecommendationService {
 
         List<Map<String, Object>> recommendations = new ArrayList<>();
         Map<String, Integer> brandCounts = new LinkedHashMap<>();
+        Map<String, List<BigDecimal>> brandSelectedValues = new LinkedHashMap<>();
+        Set<String> seenNames = new LinkedHashSet<>();
         for (Map<String, Object> c : passing) {
             if (recommendations.size() >= MAX_RECOMMENDATIONS) {
                 break;
@@ -253,7 +246,29 @@ public class RecommendationService {
             if (!brand.isBlank() && count >= 2) {
                 continue;
             }
+            String normalizedName = normalizeProductName(Objects.toString(c.get("name"), ""));
+            if (!normalizedName.isBlank() && seenNames.contains(normalizedName)) {
+                continue;
+            }
+            if (!brand.isBlank()) {
+                BigDecimal candidateVal = toBigDecimal(Objects.toString(c.get(field), ""));
+                if (candidateVal != null) {
+                    List<BigDecimal> selected = brandSelectedValues.getOrDefault(brand, Collections.emptyList());
+                    boolean duplicate = false;
+                    for (BigDecimal prev : selected) {
+                        if (prev.compareTo(candidateVal) == 0) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) {
+                        continue;
+                    }
+                    brandSelectedValues.computeIfAbsent(brand, k -> new ArrayList<>()).add(candidateVal);
+                }
+            }
             brandCounts.put(brand, count + 1);
+            seenNames.add(normalizedName);
             recommendations.add(c);
         }
 
@@ -416,10 +431,12 @@ public class RecommendationService {
 
         String gtin = stringValue(food.path("food_barcode"));
         String foodId = stringValue(food.path("food_id"));
+        String foodUrl = stringValue(food.path("food_url"));
 
         Map<String, Object> item = new LinkedHashMap<>();
         item.put("gtin", gtin);
         item.put("food_id", foodId);
+        item.put("food_url", foodUrl);
         item.put("name", stringValueOrEmpty(food.path("food_name")));
         item.put("brand", stringValue(food.path("brand_name")));
         item.put("food_type", stringValue(food.path("food_type")));
@@ -466,14 +483,15 @@ public class RecommendationService {
                                 + "(gtin, food_id, name, brand, category, categories, serving_size, "
                                 + " calories, total_fat, saturated_fat, trans_fat, cholesterol, "
                                 + " sodium, total_carbs, dietary_fiber, total_sugars, added_sugars, "
-                                + " protein, image_url, product_type) "
+                                + " protein, image_url, food_url, product_type) "
                                 + "VALUES (:gtin, :food_id, :name, :brand, :category, :categories, :serving_size, "
                                 + " :calories, :total_fat, :saturated_fat, :trans_fat, :cholesterol, "
                                 + " :sodium, :total_carbs, :dietary_fiber, :total_sugars, :added_sugars, "
-                                + " :protein, :image_url, :product_type) "
+                                + " :protein, :image_url, :food_url, :product_type) "
                                 + "ON CONFLICT (gtin) DO UPDATE SET "
                                 + "  food_id = COALESCE(fatsecret_products.food_id, EXCLUDED.food_id), "
                                 + "  categories = COALESCE(EXCLUDED.categories, fatsecret_products.categories), "
+                                + "  food_url = COALESCE(fatsecret_products.food_url, EXCLUDED.food_url), "
                                 + "  product_type = COALESCE(fatsecret_products.product_type, EXCLUDED.product_type)",
                         params);
             } else if (foodId != null && !foodId.isBlank()) {
@@ -482,12 +500,13 @@ public class RecommendationService {
                                 + "(food_id, name, brand, category, categories, serving_size, "
                                 + " calories, total_fat, saturated_fat, trans_fat, cholesterol, "
                                 + " sodium, total_carbs, dietary_fiber, total_sugars, added_sugars, "
-                                + " protein, image_url, product_type) "
+                                + " protein, image_url, food_url, product_type) "
                                 + "VALUES (:food_id, :name, :brand, :category, :categories, :serving_size, "
                                 + " :calories, :total_fat, :saturated_fat, :trans_fat, :cholesterol, "
                                 + " :sodium, :total_carbs, :dietary_fiber, :total_sugars, :added_sugars, "
-                                + " :protein, :image_url, :product_type) "
+                                + " :protein, :image_url, :food_url, :product_type) "
                                 + "ON CONFLICT (food_id) DO UPDATE SET "
+                                + "  food_url = COALESCE(fatsecret_products.food_url, EXCLUDED.food_url), "
                                 + "  product_type = COALESCE(fatsecret_products.product_type, EXCLUDED.product_type)",
                         params);
             }
@@ -516,6 +535,7 @@ public class RecommendationService {
         params.put("added_sugars", product.get("added_sugars"));
         params.put("protein", product.get("protein"));
         params.put("image_url", product.get("image_url"));
+        params.put("food_url", product.get("food_url"));
         params.put("categories", toSqlTextArray(product.get("categories")));
         params.put("product_type", UsdaService.deriveProductType(str(product, "category")));
         return params;
@@ -527,6 +547,7 @@ public class RecommendationService {
         s.put("brand", p.get("brand"));
         s.put("category", p.get("category"));
         s.put("image_url", p.get("image_url"));
+        s.put("food_url", p.get("food_url"));
         s.put("serving_size", p.get("serving_size"));
         s.put("calories", p.get("calories"));
         s.put("total_sugars", p.get("total_sugars"));
@@ -830,6 +851,17 @@ public class RecommendationService {
             return value;
         }
         return "";
+    }
+
+    private String normalizeProductName(String name) {
+        if (name == null || name.isBlank()) {
+            return "";
+        }
+        String normalized = name.replaceAll("\\(.*?\\)", " ");
+        normalized = normalized.toLowerCase();
+        normalized = normalized.replaceAll("[^a-z0-9 ]", " ");
+        normalized = normalized.trim().replaceAll("\\s+", " ");
+        return normalized;
     }
 
     private BigDecimal toBigDecimal(String val) {

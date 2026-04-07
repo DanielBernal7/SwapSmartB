@@ -130,6 +130,7 @@ public class ProductService {
                                 + "gtin = ?, name = ?, brand = ?, category = ?, "
                                 + "categories = COALESCE(?, categories), "
                                 + "image_url = COALESCE(?, image_url), "
+                                + "food_url = COALESCE(?, food_url), "
                                 + "serving_size = ?, calories = ?, total_fat = ?, "
                                 + "saturated_fat = ?, trans_fat = ?, cholesterol = ?, "
                                 + "sodium = ?, total_carbs = ?, dietary_fiber = ?, "
@@ -139,6 +140,7 @@ public class ProductService {
                         gtin, product.get("name"), product.get("brand"),
                         product.get("category"), categoriesArray,
                         product.get("image_url"),
+                        product.get("food_url"),
                         product.get("serving_size"),
                         product.get("calories"), product.get("total_fat"),
                         product.get("saturated_fat"), product.get("trans_fat"),
@@ -159,11 +161,11 @@ public class ProductService {
                 product.put("categories", toSqlTextArray((List<?>) rawCatsInsert));
             }
 
-            String cols = "gtin, food_id, name, brand, category, categories, image_url, serving_size, "
+            String cols = "gtin, food_id, name, brand, category, categories, image_url, food_url, serving_size, "
                     + "calories, total_fat, saturated_fat, trans_fat, cholesterol, "
                     + "sodium, total_carbs, dietary_fiber, total_sugars, added_sugars, "
                     + "protein, raw_json";
-            String vals = ":gtin, :food_id, :name, :brand, :category, :categories, :image_url, :serving_size, "
+            String vals = ":gtin, :food_id, :name, :brand, :category, :categories, :image_url, :food_url, :serving_size, "
                     + ":calories, :total_fat, :saturated_fat, :trans_fat, :cholesterol, "
                     + ":sodium, :total_carbs, :dietary_fiber, :total_sugars, :added_sugars, "
                     + ":protein, CAST(:raw_json AS jsonb)";
@@ -326,6 +328,7 @@ public class ProductService {
 
         Map<String, Object> product = new HashMap<>();
         product.put("food_id", food.path("food_id").asString(null));
+        product.put("food_url", food.path("food_url").asString(null));
         product.put("name", food.path("food_name").asString(""));
         product.put("brand", food.path("brand_name").asString(null));
         product.put("category", category);

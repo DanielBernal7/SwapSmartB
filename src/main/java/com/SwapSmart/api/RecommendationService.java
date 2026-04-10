@@ -543,6 +543,7 @@ public class RecommendationService {
 
     private Map<String, Object> buildSummary(Map<String, Object> p) {
         Map<String, Object> s = new LinkedHashMap<>();
+        s.put("food_id", p.get("food_id"));
         s.put("name", p.get("name"));
         s.put("brand", p.get("brand"));
         s.put("category", p.get("category"));
@@ -555,6 +556,10 @@ public class RecommendationService {
         s.put("sodium", p.get("sodium"));
         s.put("total_fat", p.get("total_fat"));
         s.put("saturated_fat", p.get("saturated_fat"));
+        s.put("trans_fat", p.get("trans_fat"));
+        s.put("polyunsaturated_fat", p.get("polyunsaturated_fat"));
+        s.put("monounsaturated_fat", p.get("monounsaturated_fat"));
+        s.put("cholesterol", p.get("cholesterol"));
         s.put("protein", p.get("protein"));
         s.put("dietary_fiber", p.get("dietary_fiber"));
         s.put("total_carbs", p.get("total_carbs"));

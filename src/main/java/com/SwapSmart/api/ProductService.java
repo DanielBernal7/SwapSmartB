@@ -339,6 +339,8 @@ public class ProductService {
         product.put("total_fat", num(serving, "fat"));
         product.put("saturated_fat", num(serving, "saturated_fat"));
         product.put("trans_fat", num(serving, "trans_fat"));
+        product.put("polyunsaturated_fat", num(serving, "polyunsaturated_fat"));
+        product.put("monounsaturated_fat", num(serving, "monounsaturated_fat"));
         product.put("cholesterol", num(serving, "cholesterol"));
         product.put("sodium", num(serving, "sodium"));
         product.put("total_carbs", num(serving, "carbohydrate"));
@@ -482,31 +484,91 @@ public class ProductService {
             }
 
             String body = http.get()
-                    .uri(fsApiBase + "/server.api?method=food.get.v2&food_id={id}&format=json", foodId)
+                    .uri(fsApiBase
+                            + "/server.api?method=food.get.v2"
+                            + "&food_id={id}"
+                            + "&flag_default_serving=true"
+                            + "&include_sub_categories=true"
+                            + "&include_food_images=true"
+                            + "&format=json",
+                            foodId)
                     .header("Authorization", "Bearer " + token)
                     .retrieve()
                     .body(String.class);
 
             JsonNode root = JsonMapper.shared().readTree(body);
             JsonNode food = root.path("food");
-            JsonNode servings = food.path("servings").path("serving");
-            JsonNode serving;
-            if (servings.isArray()) {
-                serving = servings.get(0);
-            } else {
-                serving = servings;
+            JsonNode servingsNode = food.path("servings").path("serving");
+
+            List<Map<String, Object>> allServings = new ArrayList<>();
+            JsonNode defaultServing = null;
+
+            if (servingsNode.isArray()) {
+                for (JsonNode s : servingsNode) {
+                    allServings.add(servingToMap(s));
+                    if (s.path("is_default").asInt(0) == 1) {
+                        defaultServing = s;
+                    }
+                }
+                if (defaultServing == null && !servingsNode.isEmpty()) {
+                    defaultServing = servingsNode.get(0);
+                }
+            } else if (!servingsNode.isMissingNode()) {
+                allServings.add(servingToMap(servingsNode));
+                defaultServing = servingsNode;
             }
+
+            if (defaultServing == null) {
+                defaultServing = JsonMapper.shared().createObjectNode();
+            }
+
+            String imageUrl = null;
+            JsonNode images = food.path("food_images").path("food_image");
+            if (images.isArray() && !images.isEmpty()) {
+                imageUrl = images.get(0).path("image_url").asString(null);
+            }
+
+            List<String> categories = new ArrayList<>();
+            JsonNode subCats = food.path("food_sub_categories").path("food_sub_category");
+            if (subCats.isArray()) {
+                for (JsonNode sc : subCats) {
+                    String val = sc.asString(null);
+                    if (val != null && !val.isBlank()) {
+                        categories.add(val);
+                    }
+                }
+            } else if (!subCats.isMissingNode() && !subCats.isNull()) {
+                String val = subCats.asString(null);
+                if (val != null && !val.isBlank()) {
+                    categories.add(val);
+                }
+            }
+
+            String ingredients = food.path("food_attributes").path("ingredient").path("value").asString(null);
 
             Map<String, Object> result = new HashMap<>();
             result.put("id", foodId);
             result.put("name", food.path("food_name").asString(null));
             result.put("brand", food.path("brand_name").asString(null));
-            result.put("serving_size", serving.path("serving_description").asString(null));
-            result.put("calories", serving.path("calories").asString(null));
-            result.put("fat", serving.path("fat").asString(null));
-            result.put("carbs", serving.path("carbohydrate").asString(null));
-            result.put("protein", serving.path("protein").asString(null));
-            result.put("sugar", serving.path("sugar").asString(null));
+            result.put("image_url", imageUrl);
+            result.put("categories", categories);
+            result.put("ingredients", ingredients);
+            result.put("all_servings", allServings);
+
+            result.put("serving_size", defaultServing.path("serving_description").asString(null));
+            result.put("calories", num(defaultServing, "calories"));
+            result.put("total_fat", num(defaultServing, "fat"));
+            result.put("saturated_fat", num(defaultServing, "saturated_fat"));
+            result.put("trans_fat", num(defaultServing, "trans_fat"));
+            result.put("polyunsaturated_fat", num(defaultServing, "polyunsaturated_fat"));
+            result.put("monounsaturated_fat", num(defaultServing, "monounsaturated_fat"));
+            result.put("cholesterol", num(defaultServing, "cholesterol"));
+            result.put("sodium", num(defaultServing, "sodium"));
+            result.put("total_carbs", num(defaultServing, "carbohydrate"));
+            result.put("dietary_fiber", num(defaultServing, "fiber"));
+            result.put("total_sugars", num(defaultServing, "sugar"));
+            result.put("added_sugars", num(defaultServing, "added_sugars"));
+            result.put("protein", num(defaultServing, "protein"));
 
             return result;
 
@@ -514,6 +576,29 @@ public class ProductService {
             log.error("Error fetching food details: {}", e.getMessage());
             return null;
         }
+    }
+
+    private Map<String, Object> servingToMap(JsonNode s) {
+        Map<String, Object> m = new HashMap<>();
+        m.put("serving_id", s.path("serving_id").asString(null));
+        m.put("serving_description", s.path("serving_description").asString(null));
+        m.put("serving_url", s.path("serving_url").asString(null));
+        m.put("metric_serving_amount", s.path("metric_serving_amount").asString(null));
+        m.put("metric_serving_unit", s.path("metric_serving_unit").asString(null));
+        m.put("calories", num(s, "calories"));
+        m.put("total_fat", num(s, "fat"));
+        m.put("saturated_fat", num(s, "saturated_fat"));
+        m.put("trans_fat", num(s, "trans_fat"));
+        m.put("polyunsaturated_fat", num(s, "polyunsaturated_fat"));
+        m.put("monounsaturated_fat", num(s, "monounsaturated_fat"));
+        m.put("cholesterol", num(s, "cholesterol"));
+        m.put("sodium", num(s, "sodium"));
+        m.put("total_carbs", num(s, "carbohydrate"));
+        m.put("dietary_fiber", num(s, "fiber"));
+        m.put("total_sugars", num(s, "sugar"));
+        m.put("added_sugars", num(s, "added_sugars"));
+        m.put("protein", num(s, "protein"));
+        return m;
     }
 
     private static String str(Map<String, Object> map, String key) {

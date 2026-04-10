@@ -1,3 +1,25 @@
 spring:
   application:
     name: SwapSmart-API
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+
+server:
+  port: ${PORT:8080}
+
+fatsecret:
+  client-id: ${FATSECRET_CLIENT_ID}
+  client-secret: ${FATSECRET_CLIENT_SECRET}
+  token-url: https://oauth.fatsecret.com/connect/token
+  api-base-url: https://platform.fatsecret.com/rest
+
+openfoodfacts:
+  api-base-url: https://world.openfoodfacts.org/api/v2/product
+  user-agent: SwapSmart/1.0 (capstone project - daniel@csumb.edu)
+
+usda:
+  api-key: ${USDA_API_KEY}
+  api-base-url: https://api.nal.usda.gov/fdc/v1

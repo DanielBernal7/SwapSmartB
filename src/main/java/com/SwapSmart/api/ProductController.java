@@ -1,6 +1,7 @@
 package com.SwapSmart.api;
 
 import java.util.Map;
+import java.util.LinkedHashMap;
 
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -11,21 +12,22 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
 
-//I'm just making a simple check to make sure the it's connect 
-// SHould we workign with curl http://localhost:8080/api/health
+// TODO: restrict origins before production
 @CrossOrigin(origins = "*")
 @RestController
 @RequestMapping("/api")
 public class ProductController {
     private final ProductService productService;
     private final JdbcTemplate db;
+    private final RecommendationService recommendationService;
 
-    public ProductController(ProductService productService, JdbcTemplate db) {
+    public ProductController(ProductService productService, JdbcTemplate db,
+            RecommendationService recommendationService) {
         this.productService = productService;
         this.db = db;
+        this.recommendationService = recommendationService;
     }
 
-    // This is just a quici test to make sure the database and the api is working.
     @GetMapping("/health")
     public ResponseEntity<Map<String, Object>> healthCheck() {
         Map<String, Object> status = new java.util.HashMap<>();
@@ -39,25 +41,25 @@ public class ProductController {
             return ResponseEntity.status(503).body(status);
         }
 
-        System.out.println("Everything is working");
         return ResponseEntity.ok(status);
     }
 
-    // This is the important part.
     @GetMapping("/products/{gtin}")
     public ResponseEntity<Map<String, Object>> getProduct(@PathVariable String gtin) {
         if (gtin == null || gtin.length() < 8 || gtin.length() > 14) {
-            return ResponseEntity.badRequest().body(Map.of("error", "Invalid barcode. Must be 8-14 digits."));
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "Invalid barcode. Must be 8-14 digits."));
         }
 
         Map<String, Object> product = productService.lookupProduct(gtin);
+
         if (product == null) {
-            return ResponseEntity.status(404).body(Map.of("error", "Product not found", "gtin", gtin));
+            return ResponseEntity.status(404)
+                    .body(Map.of("error", "Product not found", "gtin", gtin));
         }
 
         return ResponseEntity.ok(product);
     }
-    //new endpoint
     @GetMapping("/food-by-id/{foodId}")
     public ResponseEntity<Map<String, Object>> getFoodById(@PathVariable String foodId) {
 
@@ -71,4 +73,34 @@ public class ProductController {
         return ResponseEntity.ok(food);
     }
 
+    @GetMapping("/recommend/{gtin}")
+    public ResponseEntity<?> getRecommendations(
+            @PathVariable String gtin,
+            @RequestParam(defaultValue = "sugar") String criteria) {
+
+        if (gtin == null || gtin.length() < 8 || gtin.length() > 14) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "Invalid barcode. Must be 8-14 digits."));
+        }
+
+        if (!RecommendationService.VALID_CRITERIA.contains(criteria)) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "Invalid criteria. Must be one of: "
+                            + RecommendationService.VALID_CRITERIA));
+        }
+
+        RecommendationService.RecommendationResult result = recommendationService.recommend(gtin, criteria);
+
+        if (result == null) {
+            return ResponseEntity.status(404)
+                    .body(Map.of("error", "Product not found", "gtin", gtin));
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("scanned", result.scanned());
+        response.put("recommendations", result.recommendations());
+        response.put("criteria", result.criteria());
+
+        return ResponseEntity.ok(response);
+    }
 }

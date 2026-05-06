@@ -11,10 +11,21 @@ import org.springframework.web.client.RestClient;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.math.BigDecimal;
 import java.sql.Array;
 import java.time.Instant;
 import java.util.*;
+import javax.imageio.IIOImage;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.ImageOutputStream;
 
 import org.springframework.jdbc.core.ConnectionCallback;
 
@@ -39,7 +50,10 @@ public class ProductService {
     private String offApiBase;
     @Value("${openfoodfacts.user-agent}")
     private String offUserAgent;
-
+    @Value("${supabase.url:}")
+    private String supabaseUrl;
+    @Value("${supabase.service-key:}")
+    private String supabaseServiceKey;
     private String fsToken;
     private Instant fsTokenExpiry = Instant.MIN;
 
@@ -54,6 +68,7 @@ public class ProductService {
         Map<String, Object> product = findCached("fatsecret_products", "gtin", gtin);
         if (product != null) {
             log.info("FatSecret CACHE (by gtin)");
+            resolveImageUrl(product);
             return withSource(product, "fatsecret");
         }
 
@@ -186,11 +201,11 @@ public class ProductService {
     private void cacheProduct(String table, String gtin, Map<String, Object> product) {
         product.put("gtin", gtin);
 
-        String cols = "gtin, name, brand, category, serving_size, calories, "
+        String cols = "gtin, name, brand, category, image_url, serving_size, calories, "
                 + "total_fat, saturated_fat, trans_fat, cholesterol, sodium, "
                 + "total_carbs, dietary_fiber, total_sugars, added_sugars, protein, "
                 + "raw_json";
-        String vals = ":gtin, :name, :brand, :category, :serving_size, :calories, "
+        String vals = ":gtin, :name, :brand, :category, :image_url, :serving_size, :calories, "
                 + ":total_fat, :saturated_fat, :trans_fat, :cholesterol, :sodium, "
                 + ":total_carbs, :dietary_fiber, :total_sugars, :added_sugars, :protein, "
                 + "CAST(:raw_json AS jsonb)";
@@ -209,6 +224,7 @@ public class ProductService {
         } catch (Exception e) {
             log.error("Cache write failed: {}", e.getMessage());
         }
+
     }
 
     private Map<String, Object> fetchFromFatSecret(String gtin) {
@@ -324,6 +340,8 @@ public class ProductService {
         JsonNode images = food.path("food_images").path("food_image");
         if (images.isArray() && !images.isEmpty()) {
             imageUrl = images.get(0).path("image_url").asString(null);
+        } else if (images.isObject()) {
+            imageUrl = images.path("image_url").asString(null);
         }
 
         Map<String, Object> product = new HashMap<>();
@@ -421,6 +439,113 @@ public class ProductService {
         return null;
     }
 
+
+    public void setCustomImage(String foodId, String imageData) {
+        String publicUrl = uploadToSupabase(foodId, imageData);
+        String urlToStore;
+        if (publicUrl != null) {
+            urlToStore = publicUrl;
+        } else {
+            urlToStore = imageData;
+        }
+        db.update(
+                "UPDATE fatsecret_products SET custom_image_url = ? WHERE food_id = ?",
+                urlToStore, foodId);
+    }
+
+    private String uploadToSupabase(String foodId, String imageData) {
+        if (supabaseUrl == null || supabaseUrl.isBlank()
+                || supabaseServiceKey == null || supabaseServiceKey.isBlank()) {
+            return null;
+        }
+        try {
+            if (!imageData.startsWith("data:")) return null;
+            int semicolon = imageData.indexOf(';');
+            int comma = imageData.indexOf(',');
+            if (semicolon < 0 || comma < 0) return null;
+
+            byte[] bytes = Base64.getDecoder().decode(imageData.substring(comma + 1));
+            bytes = compressImage(bytes);
+
+            String path = foodId + ".jpg";
+            http.put()
+                    .uri(supabaseUrl + "/storage/v1/object/product-images/" + path)
+                    .header("Authorization", "Bearer " + supabaseServiceKey)
+                    .header("Content-Type", "image/jpeg")
+                    .header("x-upsert", "true")
+                    .body(bytes)
+                    .retrieve()
+                    .toBodilessEntity();
+
+            return supabaseUrl + "/storage/v1/object/public/product-images/" + path;
+        } catch (Exception e) {
+            log.error("Supabase upload failed for {}: {}", foodId, e.getMessage());
+            return null;
+        }
+    }
+
+    private byte[] compressImage(byte[] bytes) {
+        try {
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(bytes));
+            if (img == null) return bytes;
+
+            int width = img.getWidth();
+            int height = img.getHeight();
+            BufferedImage rgb = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+            Graphics2D graphics = rgb.createGraphics();
+            graphics.setColor(Color.WHITE);
+            graphics.fillRect(0, 0, width, height);
+            graphics.drawImage(img, 0, 0, null);
+            graphics.dispose();
+            img = rgb;
+
+            int maxDim = 800;
+            if (width > maxDim || height > maxDim) {
+                double scale = Math.min((double) maxDim / width, (double) maxDim / height);
+                int scaledWidth = (int) (width * scale);
+                int scaledHeight = (int) (height * scale);
+                BufferedImage resized = new BufferedImage(scaledWidth, scaledHeight, BufferedImage.TYPE_INT_RGB);
+                Graphics2D resizeGraphics = resized.createGraphics();
+                resizeGraphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                resizeGraphics.setColor(Color.WHITE);
+                resizeGraphics.fillRect(0, 0, scaledWidth, scaledHeight);
+                resizeGraphics.drawImage(img, 0, 0, scaledWidth, scaledHeight, null);
+                resizeGraphics.dispose();
+                img = resized;
+            }
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpeg");
+            if (!writers.hasNext()) return bytes;
+            ImageWriter writer = writers.next();
+            ImageWriteParam params = writer.getDefaultWriteParam();
+            params.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            params.setCompressionQuality(0.75f);
+            ImageOutputStream ios = ImageIO.createImageOutputStream(baos);
+            writer.setOutput(ios);
+            writer.write(null, new IIOImage(img, null, null), params);
+            writer.dispose();
+            ios.close();
+
+            byte[] compressed = baos.toByteArray();
+            log.info("Image compressed: {}KB → {}KB", bytes.length / 1024, compressed.length / 1024);
+            return compressed;
+        } catch (Exception e) {
+            log.warn("Image compression failed, using original: {}", e.getMessage());
+            return bytes;
+        }
+    }
+
+    private void resolveImageUrl(Map<String, Object> product) {
+        if (product.get("custom_image_url") != null) {
+            product.put("image_url", product.get("custom_image_url"));
+            return;
+        }
+        if (product.get("off_image_url") != null) {
+            product.put("image_url", product.get("off_image_url"));
+        }
+    }
+
     private Map<String, Object> withSource(Map<String, Object> product, String source) {
         product.put("source", source);
         return product;
@@ -449,7 +574,13 @@ public class ProductService {
             }
 
             String body = http.get()
-                    .uri(fsApiBase + "/foods/search/v1?search_expression={query}&page_number=0&max_results=10&format=json", query)
+                    .uri(fsApiBase
+                            + "/server.api?method=food.search.v2"
+                            + "&search_expression={query}"
+                            + "&page_number=0&max_results=10"
+                            + "&include_food_images=true"
+                            + "&format=json",
+                            query)
                     .header("Authorization", "Bearer " + token)
                     .retrieve()
                     .body(String.class);
@@ -461,10 +592,17 @@ public class ProductService {
 
             if (foods.isArray()) {
                 for (JsonNode food : foods) {
+                    String imageUrl = null;
+                    JsonNode images = food.path("food_images").path("food_image");
+                    if (images.isArray() && !images.isEmpty()) {
+                        imageUrl = images.get(0).path("image_url").asString(null);
+                    }
+
                     Map<String, Object> item = new HashMap<>();
                     item.put("id", food.path("food_id").asString());
                     item.put("name", food.path("food_name").asString());
                     item.put("brand", food.path("brand_name").asString(null));
+                    item.put("image_url", imageUrl);
                     results.add(item);
                 }
             }
@@ -547,6 +685,19 @@ public class ProductService {
             String ingredients = food.path("food_attributes").path("ingredient").path("value").asString(null);
 
             Map<String, Object> result = new HashMap<>();
+            List<Map<String, Object>> dbRows = db.queryForList(
+                    "SELECT custom_image_url, off_image_url FROM fatsecret_products WHERE food_id = ? LIMIT 1",
+                    foodId);
+            if (!dbRows.isEmpty()) {
+                Object customImg = dbRows.get(0).get("custom_image_url");
+                Object offImg = dbRows.get(0).get("off_image_url");
+                if (customImg != null) {
+                    imageUrl = customImg.toString();
+                } else if (offImg != null && imageUrl == null) {
+                    imageUrl = offImg.toString();
+                }
+            }
+
             result.put("id", foodId);
             result.put("name", food.path("food_name").asString(null));
             result.put("brand", food.path("brand_name").asString(null));

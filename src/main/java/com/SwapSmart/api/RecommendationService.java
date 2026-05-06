@@ -333,7 +333,6 @@ public class RecommendationService {
                             + "&food_type=brand"
                             + "&flag_default_serving=true"
                             + "&include_sub_categories=true"
-                            + "&include_food_images=true"
                             + "&format=json",
                             query, pageNumber, PAGE_SIZE)
                     .header("Authorization", "Bearer " + token)
@@ -427,6 +426,8 @@ public class RecommendationService {
         JsonNode images = food.path("food_images").path("food_image");
         if (images.isArray() && !images.isEmpty()) {
             imageUrl = stringValue(images.get(0).path("image_url"));
+        } else if (images.isObject()) {
+            imageUrl = stringValue(images.path("image_url"));
         }
 
         String gtin = stringValue(food.path("food_barcode"));
@@ -543,11 +544,19 @@ public class RecommendationService {
 
     private Map<String, Object> buildSummary(Map<String, Object> p) {
         Map<String, Object> s = new LinkedHashMap<>();
+        Object imageUrl = p.get("custom_image_url");
+        if (imageUrl == null) {
+            imageUrl = p.get("off_image_url");
+        }
+        if (imageUrl == null) {
+            imageUrl = p.get("image_url");
+        }
+
         s.put("food_id", p.get("food_id"));
         s.put("name", p.get("name"));
         s.put("brand", p.get("brand"));
         s.put("category", p.get("category"));
-        s.put("image_url", p.get("image_url"));
+        s.put("image_url", imageUrl);
         s.put("food_url", p.get("food_url"));
         s.put("serving_size", p.get("serving_size"));
         s.put("calories", p.get("calories"));
@@ -624,7 +633,7 @@ public class RecommendationService {
                             + "COALESCE(pf.name, pg.name) AS name, "
                             + "COALESCE(pf.brand, pg.brand) AS brand, "
                             + "COALESCE(pf.category, pg.category) AS category, "
-                            + "COALESCE(pf.image_url, pg.image_url) AS image_url, "
+                            + "COALESCE(pf.custom_image_url, pf.off_image_url, pf.image_url, pg.custom_image_url, pg.off_image_url, pg.image_url) AS image_url, "
                             + "COALESCE(pf.serving_size, pg.serving_size) AS serving_size, "
                             + "COALESCE(pf.calories, pg.calories) AS calories, "
                             + "COALESCE(pf.total_fat, pg.total_fat) AS total_fat, "

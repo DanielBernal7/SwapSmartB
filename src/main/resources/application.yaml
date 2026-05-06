@@ -23,3 +23,7 @@ openfoodfacts:
 usda:
   api-key: ${USDA_API_KEY}
   api-base-url: https://api.nal.usda.gov/fdc/v1
+
+supabase:
+  url: ${SUPABASE_URL:}
+  service-key: ${SUPABASE_SERVICE_KEY:}

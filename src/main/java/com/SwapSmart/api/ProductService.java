@@ -575,10 +575,9 @@ public class ProductService {
 
             String body = http.get()
                     .uri(fsApiBase
-                            + "/server.api?method=food.search.v2"
+                            + "/server.api?method=foods.search"
                             + "&search_expression={query}"
                             + "&page_number=0&max_results=10"
-                            + "&include_food_images=true"
                             + "&format=json",
                             query)
                     .header("Authorization", "Bearer " + token)
@@ -592,19 +591,18 @@ public class ProductService {
 
             if (foods.isArray()) {
                 for (JsonNode food : foods) {
-                    String imageUrl = null;
-                    JsonNode images = food.path("food_images").path("food_image");
-                    if (images.isArray() && !images.isEmpty()) {
-                        imageUrl = images.get(0).path("image_url").asString(null);
-                    }
-
                     Map<String, Object> item = new HashMap<>();
                     item.put("id", food.path("food_id").asString());
                     item.put("name", food.path("food_name").asString());
                     item.put("brand", food.path("brand_name").asString(null));
-                    item.put("image_url", imageUrl);
                     results.add(item);
                 }
+            } else if (!foods.isMissingNode() && !foods.isNull()) {
+                Map<String, Object> item = new HashMap<>();
+                item.put("id", foods.path("food_id").asString());
+                item.put("name", foods.path("food_name").asString());
+                item.put("brand", foods.path("brand_name").asString(null));
+                results.add(item);
             }
             return results;
 
